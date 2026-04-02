@@ -4108,8 +4108,17 @@ class VanCtlHmiCard extends LitElement {
     const slots = this._resolveSlots();
     const entities = this._entities();
 
-    // Require device selection only in legacy (no-slots) mode
-    if (!slots && (!this._selectedId || !entities)) return this._renderPicker();
+    // Auto-select first device if none selected
+    if (!this._selectedId && !slots) {
+      const devices = Object.values(this.hass.devices ?? {})
+        .filter((d) => d.identifiers?.some(([dom]) => dom === "smartvanio"));
+      if (devices.length) {
+        this._selectedId = devices[0].identifiers.find(([dom]) => dom === "smartvanio")[1];
+        return html``;
+      }
+      return this._renderPicker();
+    }
+    if (!slots && !entities) return this._renderPicker();
 
     const safeEntities = entities ?? {
       lights: [],

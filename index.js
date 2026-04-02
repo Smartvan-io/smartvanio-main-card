@@ -2916,7 +2916,7 @@ const w=globalThis,$=t=>t,k=w.trustedTypes,S=k?k.createPolicy("lit-html",{create
           `)}
         ${t.length?"":F`<div class="picker-empty">No VanCtl devices found.</div>`}
       </div>
-    `}render(){if(!this.hass)return F``;const t=this._resolveSlots(),e=this._entities();if(!(t||this._selectedId&&e))return this._renderPicker();const i=e??{lights:[],switches:[],sensors:[],binary_sensors:[],numbers:[],selects:[]},s=this._levelEntities(t),o=(t,e)=>{const i=(t??[]).map(({entity:t,name:e})=>({eid:t,state:this.hass.states[t],_slotName:e})),s=new Set(i.map(t=>t.eid));return[...i,...e.filter(t=>!s.has(t.eid))]},r=o(t?.lights,i.lights),n=o(t?.switches,this._powerSwitches(i.switches));return F`
+    `}render(){if(!this.hass)return F``;const t=this._resolveSlots(),e=this._entities();if(!this._selectedId&&!t){const t=Object.values(this.hass.devices??{}).filter(t=>t.identifiers?.some(([t])=>"smartvanio"===t));return t.length?(this._selectedId=t[0].identifiers.find(([t])=>"smartvanio"===t)[1],F``):this._renderPicker()}if(!t&&!e)return this._renderPicker();const i=e??{lights:[],switches:[],sensors:[],binary_sensors:[],numbers:[],selects:[]},s=this._levelEntities(t),o=(t,e)=>{const i=(t??[]).map(({entity:t,name:e})=>({eid:t,state:this.hass.states[t],_slotName:e})),s=new Set(i.map(t=>t.eid));return[...i,...e.filter(t=>!s.has(t.eid))]},r=o(t?.lights,i.lights),n=o(t?.switches,this._powerSwitches(i.switches));return F`
       <div class="hmi">
         <div class="main-row">
           <!-- Left: tabbed cluster panel -->
