@@ -106,7 +106,9 @@ class VanCtlHmiCard extends LitElement {
       _sceneEditName:   { type: String },
       _sceneEditLights: { type: Array },
       _sceneEditSaving: { type: Boolean },
-      _dndMode:         { type: Boolean },
+      // _dndMode removed — merged into _setupMode
+      _lightSegments:   { type: Array },
+      _maxLeds:         { type: Number },
     };
   }
 
@@ -147,8 +149,9 @@ class VanCtlHmiCard extends LitElement {
     this._editingScene    = null;
     this._sceneEditName   = "";
     this._sceneEditLights = [];
+    this._lightSegments   = [];
+    this._maxLeds         = 0;
     this._sceneEditSaving = false;
-    this._dndMode = false;
     this._gridRo = null;
     this._gridCols = 4;
     this._gridRows = 4;
@@ -173,9 +176,8 @@ class VanCtlHmiCard extends LitElement {
     this._ro.observe(document.documentElement);
     requestAnimationFrame(setH);
 
-    // Walk up through HA's shadow DOM tree and make every container
-    // transparent so the nebula on :host / body shows through.
-    this._applyNebulaBg();
+    // Clean background: remove any lingering nebula styles from previous loads
+    this._cleanupNebulaBg();
   }
 
   setConfig(config) {
@@ -204,17 +206,17 @@ class VanCtlHmiCard extends LitElement {
     if (this.hass && !this._allDevCfgUnsub) this._subscribeAllBoardConfigs();
 
     // Setup grid ResizeObserver for square cells + layout resolution
-    if (!this._setupMode) this._setupGridObserver();
-    else { this._gridRo?.disconnect(); this._gridRo = null; }
+    this._setupGridObserver();
 
-    // Toggle DnD overflow class
-    if (changedProps.has('_dndMode') || changedProps.has('_setupMode')) {
-      this.classList.toggle('dnd-active', this._dndMode && !this._setupMode);
+    // Toggle DnD overflow class (edit mode enables drag)
+    if (changedProps.has('_setupMode')) {
+      this.classList.toggle('dnd-active', this._setupMode);
     }
   }
 
   disconnectedCallback() {
     super.disconnectedCallback();
+    this._cleanupNebulaBg();
     this._ro?.disconnect();
     this._ro = null;
     this._gridRo?.disconnect();
@@ -235,46 +237,22 @@ class VanCtlHmiCard extends LitElement {
     window.removeEventListener("pointerup", this._cmUp);
   }
 
-  _applyNebulaBg() {
-    const nebula = [
-      'radial-gradient(ellipse at 15% 20%, rgba(124,131,255,0.18) 0%, transparent 50%)',
-      'radial-gradient(ellipse at 85% 15%, rgba(34,211,238,0.10) 0%, transparent 40%)',
-      'radial-gradient(ellipse at 70% 75%, rgba(244,114,182,0.08) 0%, transparent 45%)',
-      'radial-gradient(ellipse at 30% 65%, rgba(99,102,241,0.14) 0%, transparent 38%)',
-      'radial-gradient(ellipse at 50% 50%, rgba(52,211,153,0.05) 0%, transparent 55%)',
-      '#0A0E1A',
-    ].join(',');
-
-    // 1. Set nebula on html + body
-    document.documentElement.style.setProperty('background', nebula, 'important');
-    document.body.style.setProperty('background', 'transparent', 'important');
-
-    // 2. Walk up from card through shadow roots, injecting a <style> into
-    //    each one to make the host and all HA background vars transparent.
+  _cleanupNebulaBg() {
+    // Remove any nebula styles injected into HA's shadow DOM by previous versions
     const CSS_ID = 'smartvanio-nebula';
-    const transparentCSS = `
-      :host {
-        background: transparent !important;
-        --primary-background-color: transparent !important;
-        --lovelace-background: transparent !important;
-        --ha-card-background: transparent !important;
-      }
-    `;
+    document.documentElement.style.removeProperty('background');
+    document.body.style.removeProperty('background');
 
     let node = this;
     while (node) {
       const root = node.getRootNode();
       if (root instanceof ShadowRoot) {
-        if (!root.getElementById(CSS_ID)) {
-          const s = document.createElement('style');
-          s.id = CSS_ID;
-          s.textContent = transparentCSS;
-          root.appendChild(s);
-        }
-        root.host.style.setProperty('background', 'transparent', 'important');
+        const old = root.getElementById(CSS_ID);
+        if (old) old.remove();
+        root.host.style.removeProperty('background');
         node = root.host;
       } else if (node.parentElement) {
-        node.style.setProperty('background', 'transparent', 'important');
+        node.style.removeProperty('background');
         node = node.parentElement;
       } else {
         break;
@@ -308,8 +286,8 @@ class VanCtlHmiCard extends LitElement {
     try {
       const unsub = await this.hass.connection.subscribeMessage(
         (msg) => {
-          // Skip MQTT echo while in DnD mode or right after saving
-          if (this._dndMode || this._mqttSaveGuard) return;
+          // Skip MQTT echo while in edit mode or right after saving
+          if (this._setupMode || this._mqttSaveGuard) return;
           if (msg?.payload) {
             try {
               const cfg = JSON.parse(msg.payload);
@@ -372,6 +350,7 @@ class VanCtlHmiCard extends LitElement {
                 name: cfg.name,
                 model: cfg.model,
                 firmware: cfg.firmware,
+                entities: cfg.entities ?? [],
               },
             };
             // Keep single-device config in sync for setup mode auto-populate
@@ -527,7 +506,6 @@ class VanCtlHmiCard extends LitElement {
   // ── Setup mode ────────────────────────────────────────────
 
   _enterSetupMode() {
-    this._dndMode = false;
     const empty = {
       resources: [],
       pitch: null,
@@ -598,6 +576,19 @@ class VanCtlHmiCard extends LitElement {
   }
 
   _saveSetupMode() {
+    // Save layout (previously in _exitDndMode)
+    if (this._currentLayout) {
+      const layouts = { ...(this._pendingSlots?.layouts ?? {}) };
+      layouts[this._gridKey] = structuredClone(this._currentLayout);
+      const items = Object.entries(this._currentLayout)
+        .sort(([, a], [, b]) => a.row - b.row || a.col - b.col)
+        .map(([id]) => id);
+      this._pendingSlots = {
+        ...this._pendingSlots,
+        layouts,
+        tileOrder: items,
+      };
+    }
     this._cardConfig = { ...this._cardConfig, slots: this._pendingSlots };
     this._saveMqttConfig();
     this._setupMode = false;
@@ -685,38 +676,12 @@ class VanCtlHmiCard extends LitElement {
       updated[itemId] = { ...cur, w: nw, h: nh };
       this._currentLayout = applyMove(updated, itemId, cur.col, cur.row, this._gridCols);
     };
-    if (this._dndMode) {
+    if (this._setupMode) {
       update();
       this.requestUpdate();
     } else {
       this._animateGridTransition(update);
     }
-  }
-
-  _enterDndMode() {
-    this._dndMode = true;
-  }
-
-  _exitDndMode() {
-    // Save current layout under the current grid key
-    if (this._currentLayout) {
-      const layouts = { ...(this._cardConfig?.slots?.layouts ?? {}) };
-      layouts[this._gridKey] = structuredClone(this._currentLayout);
-
-      // Also maintain backward-compatible tileOrder
-      const items = Object.entries(this._currentLayout)
-        .sort(([, a], [, b]) => a.row - b.row || a.col - b.col)
-        .map(([id]) => id);
-
-      const slots = {
-        ...(this._cardConfig?.slots ?? {}),
-        layouts,
-        tileOrder: items,
-      };
-      this._cardConfig = { ...this._cardConfig, slots };
-    }
-    this._saveMqttConfig();
-    this._dndMode = false;
   }
 
   _onGroupPointerDown(e, group) {
@@ -968,6 +933,12 @@ class VanCtlHmiCard extends LitElement {
       this._gridCols
     );
     this.requestUpdate();
+  }
+
+  onTileTap(itemId) {
+    if (this._setupMode) {
+      this._openEditModal(itemId);
+    }
   }
 
   /** Find which tile occupies a given cell, excluding excludeId. */
@@ -1334,7 +1305,7 @@ class VanCtlHmiCard extends LitElement {
                     data-grp-light-eid=${eid}
                     data-grp-id=${group.id}
                     @click=${(e) => { e.stopPropagation(); this._toggleLight(eid); }}
-                    @pointerdown=${this._dndMode ? (e) => this._onGrpLightPointerDown(e, group.id, eid) : null}>
+                    @pointerdown=${this._setupMode ? (e) => this._onGrpLightPointerDown(e, group.id, eid) : null}>
                     <div class="grp-light-dot" style="background:${color};box-shadow:${glow}">
                       ${supportsColor ? html`
                         <input type="color" class="grp-light-color" .value=${hexColor}
@@ -1356,7 +1327,7 @@ class VanCtlHmiCard extends LitElement {
                       ` : ''}
                     </div>
                     <span class="grp-light-name">${name}</span>
-                    ${this._dndMode ? html`
+                    ${this._setupMode ? html`
                       <ha-icon class="grp-light-grip" icon="mdi:drag-horizontal-variant"></ha-icon>
                     ` : ''}
                   </div>
@@ -1410,7 +1381,7 @@ class VanCtlHmiCard extends LitElement {
             class="gtile-icon ${isOn ? "on" : ""}"
             icon="mdi:apps"
           ></ha-icon>
-          ${expanded && this._dndMode ? html`
+          ${expanded && this._setupMode ? html`
             <input class="gtile-name-input" type="text"
               .value=${group.name}
               @click=${(e) => e.stopPropagation()}
@@ -1989,9 +1960,19 @@ class VanCtlHmiCard extends LitElement {
     );
   }
 
+  _allSmartvanioDeviceIds() {
+    if (!this.hass) return new Set();
+    return new Set(
+      Object.values(this.hass.devices ?? {})
+        .filter((d) => d.identifiers?.some(([dom]) => dom === "smartvanio"))
+        .map((d) => d.id)
+    );
+  }
+
   _entities() {
-    const dev = this._haDevice();
-    if (!dev) return null;
+    if (!this.hass) return null;
+    const deviceIds = this._allSmartvanioDeviceIds();
+    if (!deviceIds.size) return null;
     const out = {
       lights: [],
       switches: [],
@@ -2001,11 +1982,11 @@ class VanCtlHmiCard extends LitElement {
       selects: [],
     };
     for (const [eid, entry] of Object.entries(this.hass.entities ?? {})) {
-      if (entry.device_id !== dev.id) continue;
+      if (!deviceIds.has(entry.device_id)) continue;
       const state = this.hass.states[eid];
       if (!state) continue;
       const domain = eid.split(".")[0];
-      if (domain === "light" && !state.attributes?.smartvanio_parent_entity_id)
+      if (domain === "light")
         out.lights.push({ eid, state });
       else if (domain === "switch") out.switches.push({ eid, state });
       else if (domain === "sensor") out.sensors.push({ eid, state });
@@ -2039,10 +2020,10 @@ class VanCtlHmiCard extends LitElement {
   }
 
   _deviceScenes() {
-    const dev = this._haDevice();
-    if (!dev) return [];
+    const deviceIds = this._allSmartvanioDeviceIds();
+    if (!deviceIds.size) return [];
     return Object.entries(this.hass.entities ?? {})
-      .filter(([eid, e]) => eid.startsWith("scene.") && e.device_id === dev.id)
+      .filter(([eid, e]) => eid.startsWith("scene.") && deviceIds.has(e.device_id))
       .map(([eid]) => ({ eid, state: this.hass.states[eid] }))
       .filter(({ state }) => state)
       .sort((a, b) => a.eid.localeCompare(b.eid));
@@ -2065,8 +2046,9 @@ class VanCtlHmiCard extends LitElement {
     const override = this.hass.entities?.[eid]?.name;
     if (override) return override;
     const friendly = this.hass.states[eid]?.attributes?.friendly_name ?? "";
-    const devName =
-      this._haDevice()?.name_by_user ?? this._haDevice()?.name ?? "";
+    const haDeviceId = this.hass.entities?.[eid]?.device_id;
+    const dev = haDeviceId ? this.hass.devices?.[haDeviceId] : null;
+    const devName = dev?.name_by_user ?? dev?.name ?? "";
     return devName && friendly.startsWith(devName + " ")
       ? friendly.slice(devName.length + 1)
       : friendly || eid.split(".").pop();
@@ -2098,9 +2080,10 @@ class VanCtlHmiCard extends LitElement {
   // ── Automation helpers ────────────────────────────────────
 
   _channelFromEntity(entity_id) {
-    const dev = this._haDevice();
+    const haDeviceId = this.hass.entities?.[entity_id]?.device_id;
+    const dev = haDeviceId ? this.hass.devices?.[haDeviceId] : null;
     const slug = dev
-      ? dev.name
+      ? (dev.name_by_user ?? dev.name ?? "")
           .toLowerCase()
           .replace(/[^a-z0-9]+/g, "_")
           .replace(/^_|_$/, "")
@@ -2149,16 +2132,15 @@ class VanCtlHmiCard extends LitElement {
         ],
       });
 
-    // Scenes — discovered from HA state registry, associated with this device
-    const dev = this._haDevice();
+    // Scenes — discovered from HA state registry, associated with any smartvanio device
+    const deviceIds = this._allSmartvanioDeviceIds();
     const sceneEntities = Object.entries(this.hass.states ?? {})
       .filter(([eid]) => eid.startsWith("scene."))
       .filter(
         ([eid, s]) =>
-          !dev ||
-          s.attributes?.device_id === dev.id ||
+          !deviceIds.size ||
           Object.values(this.hass.entities ?? {}).find(
-            (e) => e.entity_id === eid && e.device_id === dev.id,
+            (e) => e.entity_id === eid && deviceIds.has(e.device_id),
           ),
       )
       .map(([eid, s]) => ({
@@ -2609,42 +2591,73 @@ class VanCtlHmiCard extends LitElement {
     this._editName = this._label(entity_id);
     this._editRows = [];
     this._editOriginalIds = {};
+    this._lightSegments = [];
+    this._maxLeds = 0;
     this._editLoading = true;
     this._editSaving = false;
     this._saveError = null;
 
+    const domain = entity_id.split(".")[0];
+
     try {
-      const rows = [];
-      for (const gesture of ["press", "double_press", "hold"]) {
-        const configKey = this._automationId(entity_id, gesture);
-        try {
-          const cfg = await this.hass.callApi(
-            "GET",
-            `config/automation/config/${configKey}`,
-          );
-          const meta = JSON.parse(cfg.description ?? "{}");
-          if (meta.smartvanio) {
-            rows.push({
-              id: configKey,
-              gesture: meta.gesture ?? gesture,
-              target_entity_id: meta.target_entity_id ?? "",
-              action: meta.action ?? "",
-            });
-          }
-        } catch {} // 404 = no automation yet
+      // Load automations for buttons
+      if (domain === "button" || domain === "binary_sensor") {
+        const rows = [];
+        for (const gesture of ["press", "double_press", "hold"]) {
+          const configKey = this._automationId(entity_id, gesture);
+          try {
+            const cfg = await this.hass.callApi(
+              "GET",
+              `config/automation/config/${configKey}`,
+            );
+            const meta = JSON.parse(cfg.description ?? "{}");
+            if (meta.smartvanio) {
+              rows.push({
+                id: configKey,
+                gesture: meta.gesture ?? gesture,
+                target_entity_id: meta.target_entity_id ?? "",
+                action: meta.action ?? "",
+              });
+            }
+          } catch {} // 404 = no automation yet
+        }
+        this._editRows = rows;
+        this._editOriginalIds = Object.fromEntries(
+          rows.map((r) => [r.gesture, r.id]),
+        );
       }
-      this._editRows = rows;
-      this._editOriginalIds = Object.fromEntries(
-        rows.map((r) => [r.gesture, r.id]),
-      );
+
+      // Load segments for lights
+      if (domain === "light") {
+        const state = this.hass.states[entity_id];
+        this._maxLeds = parseInt(state?.attributes?.max_leds ?? 0, 10);
+
+        // Find existing segment entities for this light
+        const segEntities = Object.values(this.hass.states).filter(
+          (s) => s.attributes?.smartvanio_parent_entity_id === entity_id,
+        );
+        this._lightSegments = segEntities
+          .map((s) => ({
+            id: s.attributes.segment_id ?? "",
+            name: this._label(s.entity_id),
+            start: parseInt(s.attributes.segment_start ?? 0, 10),
+            end: parseInt(s.attributes.segment_end ?? 0, 10),
+            r: s.attributes.rgb_color?.[0] ?? 255,
+            g: s.attributes.rgb_color?.[1] ?? 255,
+            b: s.attributes.rgb_color?.[2] ?? 255,
+            brightness: Math.round((parseInt(s.attributes.brightness ?? 255, 10) / 255) * 100),
+            parent_entity_id: entity_id,
+          }))
+          .sort((a, b) => a.start - b.start);
+      }
     } catch (err) {
-      console.error("VanCtl: failed to load automations", err);
+      console.error("VanCtl: failed to load edit data", err);
     } finally {
       this._editLoading = false;
     }
   }
 
-  async _saveEdit({ entity_id, name, rows }) {
+  async _saveEdit({ entity_id, name, rows, lightSegments, maxLeds }) {
     this._editSaving = true;
     this._saveError = null;
     try {
@@ -2659,36 +2672,87 @@ class VanCtlHmiCard extends LitElement {
         });
       }
 
-      // Save / create automations
-      const saved = new Set();
-      for (const row of rows) {
-        if (!row.gesture || !row.target_entity_id || !row.action) continue;
-        const configKey = this._automationId(entity_id, row.gesture);
-        const cfg = this._buildAutomationConfig(
-          entity_id,
-          row.gesture,
-          row.target_entity_id,
-          row.action,
-        );
-        await this.hass.callApi(
-          "POST",
-          `config/automation/config/${configKey}`,
-          cfg,
-        );
-        saved.add(row.gesture);
+      const domain = entity_id.split(".")[0];
+
+      // Save automations (buttons)
+      if (rows?.length || Object.keys(this._editOriginalIds).length) {
+        const saved = new Set();
+        for (const row of (rows ?? [])) {
+          if (!row.gesture || !row.target_entity_id || !row.action) continue;
+          const configKey = this._automationId(entity_id, row.gesture);
+          const cfg = this._buildAutomationConfig(
+            entity_id,
+            row.gesture,
+            row.target_entity_id,
+            row.action,
+          );
+          await this.hass.callApi(
+            "POST",
+            `config/automation/config/${configKey}`,
+            cfg,
+          );
+          saved.add(row.gesture);
+        }
+        for (const gesture of Object.keys(this._editOriginalIds)) {
+          if (!saved.has(gesture)) {
+            await this.hass.callApi(
+              "DELETE",
+              `config/automation/config/${this._automationId(entity_id, gesture)}`,
+            );
+          }
+        }
+        await this.hass.callService("automation", "reload", {});
       }
 
-      // Delete removed gestures
-      for (const gesture of Object.keys(this._editOriginalIds)) {
-        if (!saved.has(gesture)) {
-          await this.hass.callApi(
-            "DELETE",
-            `config/automation/config/${this._automationId(entity_id, gesture)}`,
-          );
+      // Save segments (lights)
+      if (domain === "light" && lightSegments) {
+        // Resolve smartvanio device_id and channel from HA device registry
+        const haDeviceId = this.hass.entities?.[entity_id]?.device_id;
+        const haDevice = haDeviceId ? this.hass.devices?.[haDeviceId] : null;
+        const svIdent = haDevice?.identifiers?.find(([dom]) => dom === "smartvanio");
+        const deviceId = svIdent?.[1] ?? "";
+
+        // Match channel by finding which knownDevices entity name matches
+        let channel = "";
+        if (deviceId && this._knownDevices[deviceId]) {
+          const cfg = this._knownDevices[deviceId];
+          const friendlyName = this.hass.states[entity_id]?.attributes?.friendly_name ?? "";
+          for (const ent of cfg.entities ?? []) {
+            if (ent.type !== "light") continue;
+            // Match by entity name suffix or channel in entity_id
+            if (entity_id.includes(ent.channel) || friendlyName.includes(ent.name)) {
+              channel = ent.channel;
+              break;
+            }
+          }
+        }
+
+        if (!deviceId || !channel) {
+          console.warn("[smartvanio] Could not resolve device/channel for", entity_id, "haDeviceId=", haDeviceId, "deviceId=", deviceId, "knownDevices=", this._knownDevices);
+        }
+        if (deviceId && channel) {
+          const segPayload = {
+            max_leds: maxLeds || 0,
+            segments: (lightSegments ?? []).map((seg) => ({
+              id: seg.id || `seg_${seg.start}_${seg.end}`,
+              name: seg.name || `Segment ${seg.start}-${seg.end}`,
+              start: seg.start,
+              end: seg.end,
+              r: seg.r ?? 255,
+              g: seg.g ?? 255,
+              b: seg.b ?? 255,
+              brightness: seg.brightness ?? 100,
+              parent_entity_id: entity_id,
+            })),
+          };
+          await this.hass.callService("mqtt", "publish", {
+            topic: `smartvanio/${deviceId}/light/${channel}/segments`,
+            payload: JSON.stringify(segPayload),
+            retain: true,
+          });
         }
       }
 
-      await this.hass.callService("automation", "reload", {});
       this._editingEntity = null;
     } catch (err) {
       this._saveError =
@@ -3117,16 +3181,16 @@ class VanCtlHmiCard extends LitElement {
   // ── Scene edit ────────────────────────────────────────────
 
   _getSceneLightOptions() {
-    if (!this._selectedId || !this.hass) return [];
-    const dev = this._haDevice();
-    if (!dev) return [];
+    if (!this.hass) return [];
+    const deviceIds = this._allSmartvanioDeviceIds();
+    if (!deviceIds.size) return [];
 
     const parents = [];
     const segsByParent = {};
 
     for (const [entity_id, entry] of Object.entries(this.hass.entities ?? {})) {
       if (!entity_id.startsWith("light.")) continue;
-      if (entry.device_id !== dev.id) continue;
+      if (!deviceIds.has(entry.device_id)) continue;
       const state = this.hass.states[entity_id];
       if (!state) continue;
       const parentId = state.attributes?.smartvanio_parent_entity_id;
@@ -3612,6 +3676,8 @@ class VanCtlHmiCard extends LitElement {
   // ── Render: light tile (CarPlay style) ─────────────────────
 
   _lightIcon(eid) {
+    const state = this.hass?.states[eid];
+    if (state?.attributes?.smartvanio_parent_entity_id) return 'mdi:led-strip';
     if (/strip/i.test(eid)) return 'mdi:led-strip-variant';
     if (/spot/i.test(eid)) return 'mdi:spotlight-beam';
     if (/main/i.test(eid)) return 'mdi:lightbulb';
@@ -3621,7 +3687,7 @@ class VanCtlHmiCard extends LitElement {
   // ── Tile long-press → popover ────────────────────────────
 
   _onTilePointerDown(e, eid) {
-    if (this._dndMode) return; // Let Swapy handle all pointer events in DnD mode
+    if (this._setupMode) return; // In edit mode, drag handled by grid, tap in pointerUp
     if (e.button !== 0 && e.pointerType !== "touch") return;
     this._tileLpOrigin = { x: e.clientX, y: e.clientY };
     this._tileLpTimer = setTimeout(() => {
@@ -3633,7 +3699,7 @@ class VanCtlHmiCard extends LitElement {
   }
 
   _onTilePointerMove(e) {
-    if (this._dndMode) return;
+    if (this._setupMode) return;
     if (!this._tileLpTimer || !this._tileLpOrigin) return;
     const dx = e.clientX - this._tileLpOrigin.x;
     const dy = e.clientY - this._tileLpOrigin.y;
@@ -3645,7 +3711,10 @@ class VanCtlHmiCard extends LitElement {
   }
 
   _onTilePointerUp(e, eid) {
-    if (this._dndMode) return;
+    if (this._setupMode) {
+      this._openEditModal(eid);
+      return;
+    }
     if (!this._tileLpTimer) return; // long-press already fired or cancelled
     clearTimeout(this._tileLpTimer);
     this._tileLpTimer = null;
@@ -3733,20 +3802,23 @@ class VanCtlHmiCard extends LitElement {
 
   _renderLightTile({ eid, state, _slotName = null }) {
     const isOn = state?.state === 'on';
+    const isOffline = !state || state.state === 'unavailable';
     const bri = this._bri(eid);
     const briPct = Math.round((bri / 255) * 100);
     const rgb = state?.attributes?.rgb_color ?? [255, 200, 80];
     const [r, g, b] = rgb;
-    const bgStyle = isOn
-      ? `background: rgba(${r},${g},${b},${0.12 + 0.22 * (bri / 255)})`
-      : 'background: rgba(28,28,30,0.65)';
-    const iconColor = isOn ? `rgb(${r},${g},${b})` : '#48484a';
+    const bgStyle = isOffline
+      ? 'background: rgba(28,28,30,0.35)'
+      : isOn
+        ? `background: rgba(${r},${g},${b},${0.12 + 0.22 * (bri / 255)})`
+        : 'background: rgba(28,28,30,0.65)';
+    const iconColor = isOffline ? '#6b3030' : isOn ? `rgb(${r},${g},${b})` : '#48484a';
     const icon = this._lightIcon(eid);
     const name = this._label(eid, _slotName);
 
     return html`
       <div
-        class="ltile ${isOn ? 'on' : ''}"
+        class="ltile ${isOn ? 'on' : ''} ${isOffline ? 'offline' : ''} ${this._setupMode ? 'edit-mode' : ''}"
         style="${bgStyle}"
         data-tile-id=${eid}
         @pointerdown=${(e) => this._onTilePointerDown(e, eid)}
@@ -3756,11 +3828,11 @@ class VanCtlHmiCard extends LitElement {
       >
         <ha-icon
           class="ltile-icon"
-          icon=${icon}
-          style="color:${iconColor}"
+          icon=${this._setupMode ? 'mdi:pencil' : isOffline ? 'mdi:cloud-off-outline' : icon}
+          style="color:${this._setupMode ? '#aaa' : iconColor}"
         ></ha-icon>
         <span class="ltile-name">${name}</span>
-        ${isOn ? html`<span class="ltile-bri">${briPct}%</span>` : ''}
+        ${isOffline ? html`<span class="ltile-bri" style="color:#6b3030">Offline</span>` : !this._setupMode && isOn ? html`<span class="ltile-bri">${briPct}%</span>` : ''}
       </div>
     `;
   }
@@ -3803,20 +3875,12 @@ class VanCtlHmiCard extends LitElement {
       <div class="unified-grid-wrap">
         <div class="unified-grid-hdr">
           <span class="section-label">Controls</span>
-          ${this._dndMode
-            ? html`
-                <span class="dnd-hint">Hold &amp; drag to reorder</span>
-                <button class="dnd-done-btn" @click=${() => this._exitDndMode()}>Done</button>
-              `
-            : html`
-                <button class="dnd-toggle-btn" @click=${() => { this._enterDndMode(); }}
-                  title="Reorder tiles">
-                  <ha-icon icon="mdi:drag"></ha-icon>
-                </button>
-              `}
+          ${this._setupMode
+            ? html`<span class="dnd-hint">Tap to edit · Hold &amp; drag to reorder</span>`
+            : ''}
         </div>
-        <div class="unified-grid ${this._dndMode ? 'dnd-mode' : ''}"
-             @pointerdown=${this._dndMode ? (e) => this._dragController.start(e) : null}>
+        <div class="unified-grid ${this._setupMode ? 'dnd-mode' : ''}"
+             @pointerdown=${this._setupMode ? (e) => this._dragController.start(e) : null}>
           ${items.filter(i => i.type !== 'spacer').map(i => {
             const pos = layout[i.id];
             if (!pos) return '';
@@ -3827,7 +3891,7 @@ class VanCtlHmiCard extends LitElement {
                    data-tile-w=${pos.w} data-tile-h=${pos.h}
                    data-tile-col=${pos.col} data-tile-row=${pos.row}
                    style=${style}>
-                ${this._dndMode && this._allowedSizes(i).length > 1 ? html`
+                ${this._setupMode && this._allowedSizes(i).length > 1 ? html`
                   <button class="resize-btn" @click=${(e) => { e.stopPropagation(); this._cycleTileSize(i.id, i); }}
                     title="Resize tile">
                     <ha-icon icon="mdi:resize"></ha-icon>
@@ -3840,7 +3904,7 @@ class VanCtlHmiCard extends LitElement {
               </div>
             `;
           })}
-          ${this._dndMode ? this._renderEmptyCells(layout) : ''}
+          ${this._setupMode ? this._renderEmptyCells(layout) : ''}
           ${dc.dragging && !this._mergeTargetId ? html`
             <div class="drop-preview"
                  style="grid-column: ${dc.previewCol + 1} / span ${dc.w}; grid-row: ${dc.previewRow + 1} / span ${dc.h};">
@@ -3969,11 +4033,11 @@ class VanCtlHmiCard extends LitElement {
       <div
         class="stile ${isOn ? "on" : ""}"
         data-tile-id=${eid}
-        @click=${() => { if (!this._dndMode) this.hass.callService(eid.split(".")[0], "toggle", {}, { entity_id: eid }); }}
+        @click=${() => { this._setupMode ? this._openEditModal(eid) : this.hass.callService(eid.split(".")[0], "toggle", {}, { entity_id: eid }); }}
       >
-        <ha-icon class="stile-icon" icon=${icon}></ha-icon>
+        <ha-icon class="stile-icon" icon=${this._setupMode ? 'mdi:pencil' : icon} style="color:${this._setupMode ? '#aaa' : ''}"></ha-icon>
         <span class="stile-name">${this._label(eid, _slotName)}</span>
-        <span class="stile-badge">${isOn ? "ON" : "OFF"}</span>
+        <span class="stile-badge">${this._setupMode ? '' : isOn ? "ON" : "OFF"}</span>
       </div>
     `;
   }
@@ -4108,17 +4172,18 @@ class VanCtlHmiCard extends LitElement {
     const slots = this._resolveSlots();
     const entities = this._entities();
 
-    // Auto-select first device if none selected
-    if (!this._selectedId && !slots) {
+    // Auto-select first device for MQTT config operations (hmi_config, scenes)
+    if (!this._selectedId) {
       const devices = Object.values(this.hass.devices ?? {})
         .filter((d) => d.identifiers?.some(([dom]) => dom === "smartvanio"));
       if (devices.length) {
         this._selectedId = devices[0].identifiers.find(([dom]) => dom === "smartvanio")[1];
-        return html``;
       }
-      return this._renderPicker();
     }
-    if (!slots && !entities) return this._renderPicker();
+
+    if (!entities && !this._allSmartvanioDeviceIds().size) {
+      return html`<div class="picker"><div class="picker-title">SmartVan.io</div><div class="picker-empty">No devices found. Add a device via Settings → Devices & Services.</div></div>`;
+    }
 
     const safeEntities = entities ?? {
       lights: [],
@@ -4190,34 +4255,7 @@ class VanCtlHmiCard extends LitElement {
 
             ${this._setupMode ? "" : this._renderPinnedActions()}
 
-            ${this._setupMode
-              ? html`
-                  <div class="acc-scroll">
-                    <div class="acc-section">
-                      <div
-                        class="acc-hdr"
-                        @click=${() => this._toggleSection("groups")}
-                      >
-                        <span class="acc-title">Groups</span>
-                        <span class="acc-chevron ${this._openSections.groups ? "open" : ""}">›</span>
-                      </div>
-                      ${this._openSections.groups ? this._renderSetupGroups() : ""}
-                    </div>
-                    <div class="acc-section">
-                      <div class="acc-hdr" style="cursor:default">
-                        <span class="acc-title">Lighting</span>
-                      </div>
-                      <div class="lights">${this._renderSetupLighting()}</div>
-                    </div>
-                    <div class="acc-section">
-                      <div class="acc-hdr" style="cursor:default">
-                        <span class="acc-title">Switches</span>
-                      </div>
-                      <div class="switch-grid">${this._renderSetupSwitches()}</div>
-                    </div>
-                  </div>
-                `
-              : this._renderUnifiedGrid(slots, lights, powerSwitches)}
+            ${this._renderUnifiedGrid(slots, lights, powerSwitches)}
           </div>
         </div>
 
@@ -4255,7 +4293,11 @@ class VanCtlHmiCard extends LitElement {
                 .editRows=${this._editRows}
                 ?edit-saving=${this._editSaving}
                 ?edit-loading=${this._editLoading}
-                ?is-button=${true}
+                ?is-button=${this._editingEntity.startsWith("button.") || this._editingEntity.startsWith("binary_sensor.")}
+                ?is-light=${this._editingEntity.startsWith("light.")}
+                ?is-tank=${this._editingEntity.startsWith("sensor.") && (this.hass.states[this._editingEntity]?.attributes?.device_class === "volume" || this._editingEntity.includes("tank"))}
+                .lightSegments=${this._lightSegments}
+                max-leds=${this._maxLeds}
                 .targetEntities=${this._getTargetEntities()}
                 save-error=${this._saveError ?? ""}
                 @smartvanio-modal-close=${() => {
@@ -4283,6 +4325,47 @@ class VanCtlHmiCard extends LitElement {
                     const updated = { ...r, [field]: value };
                     if (field === "target_entity_id") updated.action = "";
                     return updated;
+                  });
+                }}
+                @smartvanio-add-segment=${() => {
+                  console.log("[smartvanio] add-segment fired, current segments:", this._lightSegments.length);
+                  const nextStart = this._lightSegments.length
+                    ? Math.max(...this._lightSegments.map((s) => s.end)) + 1
+                    : 0;
+                  const nextEnd = Math.min(nextStart + 9, Math.max((this._maxLeds || 100) - 1, nextStart));
+                  this._lightSegments = [
+                    ...this._lightSegments,
+                    {
+                      id: `seg_${Date.now()}`,
+                      name: "",
+                      start: nextStart,
+                      end: nextEnd,
+                      r: 255, g: 255, b: 255,
+                      brightness: 100,
+                      parent_entity_id: this._editingEntity,
+                    },
+                  ];
+                }}
+                @smartvanio-remove-segment=${(e) => {
+                  this._lightSegments = this._lightSegments.filter(
+                    (s, i) => (s.id ?? i) !== e.detail.id,
+                  );
+                }}
+                @smartvanio-update-segment=${(e) => {
+                  const { id, field, value } = e.detail;
+                  if (field === "maxLeds") {
+                    this._maxLeds = value;
+                    return;
+                  }
+                  this._lightSegments = this._lightSegments.map((s, i) => {
+                    if ((s.id ?? i) !== id) return s;
+                    if (field === "color") {
+                      const r = parseInt(value.slice(1, 3), 16);
+                      const g = parseInt(value.slice(3, 5), 16);
+                      const b = parseInt(value.slice(5, 7), 16);
+                      return { ...s, r, g, b };
+                    }
+                    return { ...s, [field]: value };
                   });
                 }}
                 @smartvanio-save-edit=${(e) => this._saveEdit(e.detail)}
@@ -4330,13 +4413,7 @@ class VanCtlHmiCard extends LitElement {
           -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", sans-serif;
         -webkit-font-smoothing: antialiased;
         /* height is set dynamically to parentElement.clientHeight via ResizeObserver */
-        background:
-          radial-gradient(ellipse at 15% 20%, rgba(124,131,255,0.18) 0%, transparent 50%),
-          radial-gradient(ellipse at 85% 15%, rgba(34,211,238,0.10) 0%, transparent 40%),
-          radial-gradient(ellipse at 70% 75%, rgba(244,114,182,0.08) 0%, transparent 45%),
-          radial-gradient(ellipse at 30% 65%, rgba(99,102,241,0.14) 0%, transparent 38%),
-          radial-gradient(ellipse at 50% 50%, rgba(52,211,153,0.05) 0%, transparent 55%),
-          #0A0E1A;
+        background: #0A0E1A;
         /* Dark theme CSS vars — cascade into nested shadow roots (smartvanio-modal-edit etc.) */
         --primary-color: #5cacff;
         --primary-text-color: #f0f6fc;
@@ -5952,6 +6029,8 @@ class VanCtlHmiCard extends LitElement {
       }
 
       .ltile.on .ltile-name { color: #f0f6fc; }
+      .ltile.offline { opacity: 0.5; }
+      .ltile.offline .ltile-name { color: #6b3030; }
 
       .ltile-bri {
         font-size: 9px;

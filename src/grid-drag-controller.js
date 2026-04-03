@@ -5,6 +5,7 @@
  * The host must implement:
  *   - host.onTileDragMove(itemId, col, row)   → called during drag
  *   - host.onTileDragEnd(itemId, col, row)    → called on drop
+ *   - host.onTileTap(itemId)                  → called on short tap (no drag)
  *   - host.shadowRoot                          → for DOM queries
  *   - host._gridCellW                          → cell size in px
  *   - host._gridCols                           → number of columns
@@ -35,6 +36,12 @@ export class GridDragController {
     this._scrollEl = null;
     this._scrollRAF = null;
     this._pointerId = null;
+
+    // Drag threshold state
+    this._pending = false;
+    this._startX = 0;
+    this._startY = 0;
+    this._dragThreshold = 8; // px movement before drag activates
 
     // Bind handlers once
     this._onPointerMove = this._onPointerMove.bind(this);
@@ -70,21 +77,41 @@ export class GridDragController {
     if (!gridEl) return false;
 
     const tileRect = tileEl.getBoundingClientRect();
-    const gridRect = gridEl.getBoundingClientRect();
 
-    // Parse tile size from data attributes
+    // Store pending state — don't start actual drag yet
+    this._pending = true;
+    this._startX = e.clientX;
+    this._startY = e.clientY;
     this.itemId = itemId;
     this.w = parseInt(tileEl.dataset.tileW, 10) || 1;
     this.h = parseInt(tileEl.dataset.tileH, 10) || 1;
-    this.dragging = true;
     this._tileEl = tileEl;
-    this._gridRect = gridRect;
     this._scrollEl = gridEl;
     this._pointerId = e.pointerId;
-
-    // Offset from tile top-left to pointer — used to position ghost AND preview
     this._offsetX = e.clientX - tileRect.left;
     this._offsetY = e.clientY - tileRect.top;
+
+    // Capture pointer on the grid so we get move/up even outside
+    gridEl.setPointerCapture(e.pointerId);
+    gridEl.addEventListener("pointermove", this._onPointerMove);
+    gridEl.addEventListener("pointerup", this._onPointerUp);
+    gridEl.addEventListener("pointercancel", this._onPointerUp);
+
+    return true;
+  }
+
+  // ── Actually begin the visual drag ──────────────────────
+
+  _beginDrag() {
+    this._pending = false;
+    this.dragging = true;
+
+    const gridEl = this._scrollEl;
+    const tileEl = this._tileEl;
+    if (!gridEl || !tileEl) return;
+
+    const tileRect = tileEl.getBoundingClientRect();
+    this._gridRect = gridEl.getBoundingClientRect();
 
     // Compute initial preview position from the tile's current grid placement
     this.previewCol = parseInt(tileEl.dataset.tileCol, 10) || 0;
@@ -97,19 +124,22 @@ export class GridDragController {
     tileEl.style.opacity = "0";
     tileEl.style.pointerEvents = "none";
 
-    // Capture pointer on the grid so we get move/up even outside
-    gridEl.setPointerCapture(e.pointerId);
-    gridEl.addEventListener("pointermove", this._onPointerMove);
-    gridEl.addEventListener("pointerup", this._onPointerUp);
-    gridEl.addEventListener("pointercancel", this._onPointerUp);
-
     this.host.requestUpdate();
-    return true;
   }
 
   // ── Pointer handlers ─────────────────────────────────────
 
   _onPointerMove(e) {
+    if (this._pending) {
+      const dx = e.clientX - this._startX;
+      const dy = e.clientY - this._startY;
+      if (Math.sqrt(dx * dx + dy * dy) >= this._dragThreshold) {
+        this._beginDrag();
+      } else {
+        return; // Haven't moved enough yet
+      }
+    }
+
     if (!this.dragging) return;
 
     // Move ghost
@@ -153,6 +183,16 @@ export class GridDragController {
   }
 
   _onPointerUp(e) {
+    if (this._pending) {
+      // Pointer released before drag threshold — this is a tap
+      this._pending = false;
+      if (this.host.onTileTap) {
+        this.host.onTileTap(this.itemId);
+      }
+      this._cleanup();
+      return;
+    }
+
     if (!this.dragging) return;
 
     this.host.onTileDragEnd(this.itemId, this.previewCol, this.previewRow);
@@ -217,6 +257,8 @@ export class GridDragController {
   // ── Cleanup ──────────────────────────────────────────────
 
   _cleanup() {
+    this._pending = false;
+
     if (this._scrollRAF) {
       cancelAnimationFrame(this._scrollRAF);
       this._scrollRAF = null;
