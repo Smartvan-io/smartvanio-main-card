@@ -156,7 +156,7 @@ class VanCtlHmiCard extends LitElement {
     this._gridCols = 4;
     this._gridRows = 4;
     this._gridCellW = 72;
-    this._gridKey = "4x4";
+    this._gridKey = "4";
     this._currentLayout = null;
     this._dragController = new GridDragController(this);
     this._cmMove = (e) => this._onClimatePointerMove(e);
@@ -374,6 +374,40 @@ class VanCtlHmiCard extends LitElement {
   // legacy device-id auto-discovery mode.
 
   _resolveSlots() {
+    // In setup mode, use pending slots (which includes unsaved group changes)
+    if (this._setupMode && this._pendingSlots) {
+      const ps = this._pendingSlots;
+      const norm = (arr) =>
+        (arr ?? []).map((item) =>
+          typeof item === "string" ? { entity: item } : { ...item },
+        );
+      return {
+        resources: norm(ps.resources),
+        pitch: ps.pitch ?? null,
+        roll: ps.roll ?? null,
+        temperature: ps.temperature ?? null,
+        fans: norm(ps.fans),
+        lights: norm(ps.lights),
+        switches: norm(ps.switches),
+        status_sensors: ps.status_sensors ?? [],
+        water_temp: ps.water_temp ?? null,
+        target_temp: ps.target_temp ?? null,
+        fan_speed: ps.fan_speed ?? null,
+        climate_mode: ps.climate_mode ?? null,
+        heater: ps.heater ?? null,
+        water_pump: ps.water_pump ?? null,
+        groups: (ps.groups ?? []).map((g) => ({
+          id: g.id ?? `grp_${Math.random().toString(36).slice(2)}`,
+          name: g.name ?? "Group",
+          lights: g.lights ?? [],
+          scenes: g.scenes ?? [],
+        })),
+        tileOrder: ps.tileOrder ?? null,
+        layouts: ps.layouts ?? null,
+        buttons: norm(ps.buttons ?? []),
+      };
+    }
+
     // MQTT-persisted slots (saved via setup mode) take priority over YAML config
     const cfgSlots = this._cardConfig?.slots ?? this.config?.slots;
 
@@ -565,6 +599,9 @@ class VanCtlHmiCard extends LitElement {
           pending.resources.push({ entity: eid, name, color });
       });
     }
+
+    // Carry over layouts from saved config so _saveSetupMode doesn't lose them
+    pending.layouts = structuredClone(this._cardConfig?.slots?.layouts ?? {});
 
     this._pendingSlots = pending;
     this._setupMode = true;
@@ -774,7 +811,7 @@ class VanCtlHmiCard extends LitElement {
       this._gridRows = rows;
       this._gridCellW = cellW;
       this._gridGap = gap;
-      this._gridKey = `${cols}x${rows}`;
+      this._gridKey = `${cols}`;
 
       if (oldKey !== this._gridKey || !this._currentLayout) {
         this._applyLayoutForCurrentGrid();
@@ -795,9 +832,15 @@ class VanCtlHmiCard extends LitElement {
     const key = this._gridKey;
     const items = this._getAllTileItems();
 
-    if (layouts[key]) {
-      // Exact match — use it, but ensure new items are added
-      this._currentLayout = this._mergeNewItems(structuredClone(layouts[key]), items);
+    // Check for exact match or legacy "NxM" key where N matches columns
+    let matchKey = layouts[key] ? key : null;
+    if (!matchKey) {
+      for (const k of Object.keys(layouts)) {
+        if (k.startsWith(key + "x")) { matchKey = k; break; }
+      }
+    }
+    if (matchKey) {
+      this._currentLayout = this._mergeNewItems(structuredClone(layouts[matchKey]), items);
     } else {
       // Find closest saved layout and reflow
       const bestKey = findClosestLayoutKey(layouts, this._gridCols, this._gridRows);
@@ -966,8 +1009,23 @@ class VanCtlHmiCard extends LitElement {
   }
 
   /** Merge two items into a group. */
+  _activeSlots() {
+    return this._setupMode && this._pendingSlots
+      ? this._pendingSlots
+      : (this._cardConfig?.slots ?? {});
+  }
+
+  _writeSlots(slots) {
+    if (this._setupMode) {
+      this._pendingSlots = slots;
+    } else {
+      this._cardConfig = { ...this._cardConfig, slots };
+      this._saveMqttConfig();
+    }
+  }
+
   _mergeIntoGroup(dragged, target, col, row) {
-    const slots = { ...(this._cardConfig?.slots ?? {}) };
+    const slots = { ...this._activeSlots() };
     const groups = [...(slots.groups ?? [])];
 
     // Collect entity IDs from both items
@@ -983,21 +1041,18 @@ class VanCtlHmiCard extends LitElement {
     let groupId;
 
     if (target.type === 'group') {
-      // Add dragged light(s) to existing group
       groupId = target.id;
       const idx = groups.findIndex(g => g.id === groupId);
       if (idx !== -1) {
         groups[idx] = { ...groups[idx], lights: allLights };
       }
     } else if (dragged.type === 'group') {
-      // Add target light to existing group
       groupId = dragged.id;
       const idx = groups.findIndex(g => g.id === groupId);
       if (idx !== -1) {
         groups[idx] = { ...groups[idx], lights: allLights };
       }
     } else {
-      // Create new group from two lights
       groupId = `grp_${Date.now()}`;
       groups.push({
         id: groupId,
@@ -1008,7 +1063,7 @@ class VanCtlHmiCard extends LitElement {
     }
 
     slots.groups = groups;
-    this._cardConfig = { ...this._cardConfig, slots };
+    this._writeSlots(slots);
 
     // Update layout
     const layout = { ...this._currentLayout };
@@ -1218,18 +1273,17 @@ class VanCtlHmiCard extends LitElement {
 
   _renameGroup(groupId, name) {
     if (!name?.trim()) return;
-    const slots = { ...(this._cardConfig?.slots ?? {}) };
+    const slots = { ...this._activeSlots() };
     const groups = [...(slots.groups ?? [])];
     const idx = groups.findIndex(g => g.id === groupId);
     if (idx === -1) return;
     groups[idx] = { ...groups[idx], name: name.trim() };
     slots.groups = groups;
-    this._cardConfig = { ...this._cardConfig, slots };
-    this._saveMqttConfig();
+    this._writeSlots(slots);
   }
 
   _removeLightFromGroup(groupId, eid, dropCol, dropRow) {
-    const slots = { ...(this._cardConfig?.slots ?? {}) };
+    const slots = { ...this._activeSlots() };
     const groups = [...(slots.groups ?? [])];
     const idx = groups.findIndex(g => g.id === groupId);
     if (idx === -1) return;
@@ -1245,8 +1299,7 @@ class VanCtlHmiCard extends LitElement {
     }
 
     slots.groups = groups;
-    this._cardConfig = { ...this._cardConfig, slots };
-    this._saveMqttConfig();
+    this._writeSlots(slots);
 
     // Update layout: place removed light as standalone tile
     if (this._currentLayout) {
@@ -3846,9 +3899,17 @@ class VanCtlHmiCard extends LitElement {
 
     // Build layout if needed
     if (!this._currentLayout) {
-      if (this._cardConfig?.slots?.layouts?.[this._gridKey]) {
+      const savedLayouts = this._cardConfig?.slots?.layouts ?? {};
+      // Check exact key or legacy "NxM" key
+      let lk = savedLayouts[this._gridKey] ? this._gridKey : null;
+      if (!lk) {
+        for (const k of Object.keys(savedLayouts)) {
+          if (k.startsWith(this._gridKey + "x")) { lk = k; break; }
+        }
+      }
+      if (lk) {
         this._currentLayout = this._mergeNewItems(
-          structuredClone(this._cardConfig.slots.layouts[this._gridKey]),
+          structuredClone(savedLayouts[lk]),
           items
         );
       } else if (tileOrder?.length) {

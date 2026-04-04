@@ -268,8 +268,10 @@ export function findClosestLayoutKey(layouts, targetCols, targetRows) {
   let bestKey = null;
   let bestDist = Infinity;
   for (const key of Object.keys(layouts)) {
-    const [c, r] = key.split("x").map(Number);
-    const dist = Math.abs(c - targetCols) * 10 + Math.abs(r - targetRows);
+    // Support both column-only keys ("4") and legacy "NxM" keys
+    const parts = key.split("x").map(Number);
+    const c = parts[0];
+    const dist = Math.abs(c - targetCols);
     if (dist < bestDist) {
       bestDist = dist;
       bestKey = key;
