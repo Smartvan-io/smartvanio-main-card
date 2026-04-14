@@ -5,6 +5,7 @@ import {
 } from "lit";
 import { hexToRgb, rgbToHex, sharedTileStyles } from "../smartvanio-shared.js";
 import "./smartvanio-select.js";
+import "./smartvanio-entity-picker.js";
 
 class VanCtlModalScene extends LitElement {
   static get properties() {
@@ -27,6 +28,18 @@ class VanCtlModalScene extends LitElement {
     this.allScenes = [];
   }
 
+  _entityLabel(eid) {
+    const override = this.hass?.entities?.[eid]?.name;
+    if (override) return override;
+    const friendly = this.hass?.states[eid]?.attributes?.friendly_name ?? "";
+    const haDeviceId = this.hass?.entities?.[eid]?.device_id;
+    const dev = haDeviceId ? this.hass?.devices?.[haDeviceId] : null;
+    const devName = dev?.name_by_user ?? dev?.name ?? "";
+    return devName && friendly.startsWith(devName + " ")
+      ? friendly.slice(devName.length + 1)
+      : friendly || eid.split(".").pop();
+  }
+
   _emit(name, detail = {}) {
     this.dispatchEvent(new CustomEvent(name, {
       detail,
@@ -40,12 +53,8 @@ class VanCtlModalScene extends LitElement {
     const isNew = this.editingScene === "new";
 
     const usedEids = new Set((this.sceneEditLights ?? []).map((l) => l.entity_id));
-    const lightOptionGroups = this.lightOptions ?? [];
-    const hasAvailable = lightOptionGroups.some((g) =>
-      g.options
-        ? g.options.some((o) => !usedEids.has(o.value))
-        : !usedEids.has(g.value),
-    );
+    const hasAvailable = this.hass ? Object.keys(this.hass.states)
+      .some((eid) => eid.startsWith("light.") && !usedEids.has(eid)) : false;
 
     return html`
       <div
@@ -86,25 +95,15 @@ class VanCtlModalScene extends LitElement {
                 </button>
               </div>
 
-              <!-- Add-light dropdown -->
-              <smartvanio-select
-                variant="add"
-                value=""
-                .options=${lightOptionGroups
-                  .map((group) => {
-                    if (group.options) {
-                      const available = group.options.filter((o) => !usedEids.has(o.value));
-                      if (!available.length) return null;
-                      return group.groupLabel
-                        ? { groupLabel: group.groupLabel, options: available }
-                        : available[0];
-                    }
-                    return usedEids.has(group.value) ? null : group;
-                  })
-                  .filter(Boolean)}
-                .placeholder=${hasAvailable ? "+ Add light…" : "All lights added"}
+              <!-- Add-light picker -->
+              <smartvanio-entity-picker
+                .hass=${this.hass}
+                .value=${""}
+                .domains=${["light"]}
+                .excludeEntities=${[...usedEids]}
+                placeholder=${hasAvailable ? "+ Add light…" : "All lights added"}
                 @smartvanio-change=${(e) => { if (e.detail.value) this._emit("smartvanio-add-scene-light", { entity_id: e.detail.value }); }}
-              ></smartvanio-select>
+              ></smartvanio-entity-picker>
 
               <!-- Light list -->
               ${!(this.sceneEditLights ?? []).length
@@ -114,73 +113,87 @@ class VanCtlModalScene extends LitElement {
                 const isOn = (light.state ?? "ON").toUpperCase() === "ON";
                 const [r, g, b] = light.rgb_color ?? [255, 255, 255];
                 const bri = Math.round(((light.brightness ?? 255) / 255) * 100);
-                const supRgb =
-                  this.hass?.states[light.entity_id]?.attributes?.supported_color_modes?.includes("rgb") ?? false;
+                const stateObj = this.hass?.states[light.entity_id];
+                const supRgb = stateObj?.attributes?.supported_color_modes?.includes("rgb") ?? false;
+                const effectList = stateObj?.attributes?.effect_list ?? [];
+                const hasEffects = effectList.length > 0;
+                const currentEffect = light.effect ?? "";
                 const colorHex = rgbToHex(r, g, b);
                 const sliderColor = isOn ? `rgb(${r},${g},${b})` : "rgba(128,128,128,0.4)";
                 const sliderBg = `linear-gradient(to right, ${sliderColor} 0%, ${sliderColor} ${bri}%, var(--slider-track,#e0e0e0) ${bri}%, var(--slider-track,#e0e0e0) 100%)`;
-                const label = this.hass?.entities?.[light.entity_id]?.name ||
-                  this.hass?.states[light.entity_id]?.attributes?.friendly_name ||
-                  light.entity_id.split(".").pop();
+                const label = this._entityLabel(light.entity_id);
 
                 return html`
-                  <div class="scene-light-row">
-                    <span class="scene-light-name">${label}</span>
-                    <button
-                      class="scene-state-btn ${isOn ? "on" : ""}"
-                      @click=${() => this._emit("smartvanio-update-scene-light", {
-                        entity_id: light.entity_id,
-                        field: "state",
-                        value: isOn ? "OFF" : "ON",
-                      })}
-                    >
-                      ${isOn ? "On" : "Off"}
-                    </button>
-                    ${isOn
-                      ? html`
+                  <div class="scene-light-card">
+                    <div class="scene-light-row">
+                      <span class="scene-light-name">${label}</span>
+                      <button
+                        class="scene-state-btn ${isOn ? "on" : ""}"
+                        @click=${() => this._emit("smartvanio-update-scene-light", {
+                          entity_id: light.entity_id,
+                          field: "state",
+                          value: isOn ? "OFF" : "ON",
+                        })}
+                      >
+                        ${isOn ? "On" : "Off"}
+                      </button>
+                      <button
+                        class="delete-row-btn"
+                        @click=${() => this._emit("smartvanio-remove-scene-light", { entity_id: light.entity_id })}
+                      >
+                        <ha-icon icon="mdi:close"></ha-icon>
+                      </button>
+                    </div>
+                    <div class="scene-light-controls">
+                      ${isOn ? html`
+                        <input
+                          type="range"
+                          class="br-slider scene-light-bri"
+                          min="1"
+                          max="100"
+                          .value=${String(bri)}
+                          style="--sc:rgb(${r},${g},${b}); background:${sliderBg}"
+                          @input=${(e) => {
+                            const pct = e.target.value;
+                            const c = `rgb(${r},${g},${b})`;
+                            e.target.style.background = `linear-gradient(to right,${c} 0%,${c} ${pct}%,var(--slider-track,#e0e0e0) ${pct}%,var(--slider-track,#e0e0e0) 100%)`;
+                          }}
+                          @change=${(e) => this._emit("smartvanio-update-scene-light", {
+                            entity_id: light.entity_id,
+                            field: "brightness",
+                            value: Math.round((+e.target.value / 100) * 255),
+                          })}
+                        />
+                        ${supRgb && !currentEffect ? html`
                           <input
-                            type="range"
-                            class="br-slider scene-light-bri"
-                            min="1"
-                            max="100"
-                            .value=${String(bri)}
-                            style="--sc:rgb(${r},${g},${b}); background:${sliderBg}"
+                            type="color"
+                            class="seg-color-input scene-light-color"
+                            .value=${colorHex}
                             @input=${(e) => {
-                              const pct = e.target.value;
-                              const c = `rgb(${r},${g},${b})`;
-                              e.target.style.background = `linear-gradient(to right,${c} 0%,${c} ${pct}%,var(--slider-track,#e0e0e0) ${pct}%,var(--slider-track,#e0e0e0) 100%)`;
+                              const [cr, cg, cb] = hexToRgb(e.target.value);
+                              this._emit("smartvanio-update-scene-light", {
+                                entity_id: light.entity_id,
+                                field: "rgb_color",
+                                value: [cr, cg, cb],
+                              });
                             }}
-                            @change=${(e) => this._emit("smartvanio-update-scene-light", {
-                              entity_id: light.entity_id,
-                              field: "brightness",
-                              value: Math.round((+e.target.value / 100) * 255),
-                            })}
                           />
-                          ${supRgb
-                            ? html`
-                                <input
-                                  type="color"
-                                  class="seg-color-input scene-light-color"
-                                  .value=${colorHex}
-                                  @input=${(e) => {
-                                    const [cr, cg, cb] = hexToRgb(e.target.value);
-                                    this._emit("smartvanio-update-scene-light", {
-                                      entity_id: light.entity_id,
-                                      field: "rgb_color",
-                                      value: [cr, cg, cb],
-                                    });
-                                  }}
-                                />
-                              `
-                            : ""}
-                        `
-                      : ""}
-                    <button
-                      class="delete-row-btn"
-                      @click=${() => this._emit("smartvanio-remove-scene-light", { entity_id: light.entity_id })}
-                    >
-                      <ha-icon icon="mdi:close"></ha-icon>
-                    </button>
+                        ` : ""}
+                      ` : ""}
+                      <smartvanio-select
+                        .value=${currentEffect}
+                        ?disabled=${!hasEffects}
+                        .options=${hasEffects ? [
+                          { value: "", label: "No effect" },
+                          ...effectList.map(e => ({ value: e, label: e })),
+                        ] : [{ value: "", label: "No effects" }]}
+                        @smartvanio-change=${(e) => this._emit("smartvanio-update-scene-light", {
+                          entity_id: light.entity_id,
+                          field: "effect",
+                          value: e.detail.value || null,
+                        })}
+                      ></smartvanio-select>
+                    </div>
                   </div>
                 `;
               })}
@@ -367,17 +380,30 @@ class VanCtlModalScene extends LitElement {
           --mdc-icon-size: 18px;
         }
 
-        /* ── Scene light rows ──── */
+        /* ── Scene light cards ──── */
+        .scene-light-card {
+          padding: 10px 12px;
+          border-radius: 8px;
+          background: var(--secondary-background-color, rgba(255,255,255,0.04));
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
         .scene-light-row {
           display: flex;
           align-items: center;
           gap: 8px;
-          padding: 8px 0;
-          border-bottom: 1px solid var(--divider-color, rgba(0, 0, 0, 0.06));
           flex-wrap: nowrap;
         }
-        .scene-light-row:last-child {
-          border-bottom: none;
+        .scene-light-controls {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+        .scene-light-controls smartvanio-select {
+          flex: 1;
+          min-width: 120px;
         }
 
         .scene-light-name {

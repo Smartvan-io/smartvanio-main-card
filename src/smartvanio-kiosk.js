@@ -165,5 +165,6 @@ class VanCtlKiosk {
 }
 
 Promise.resolve(customElements.whenDefined("hui-view")).then(() => {
+  if (new URLSearchParams(window.location.search).has("disable_km")) return;
   window.VanCtlKiosk = new VanCtlKiosk();
 });

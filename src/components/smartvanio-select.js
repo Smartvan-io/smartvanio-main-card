@@ -24,6 +24,7 @@ class VanCtlSelect extends LitElement {
       options:     { type: Array },
       placeholder: { type: String },
       variant:     { type: String }, // "default" | "add"
+      disabled:    { type: Boolean },
     };
   }
 
@@ -52,7 +53,7 @@ class VanCtlSelect extends LitElement {
   render() {
     return html`
       <div class="wrap ${this.variant ?? "default"}">
-        <select .value=${this.value ?? ""} @change=${this._onChange}>
+        <select .value=${this.value ?? ""} ?disabled=${this.disabled} @change=${this._onChange}>
           ${this.placeholder !== undefined
             ? html`<option value="" ?selected=${!this.value}>${this.placeholder}</option>`
             : ""}
@@ -68,7 +69,7 @@ class VanCtlSelect extends LitElement {
 
   static get styles() {
     return css`
-      :host { display: contents; }
+      :host { display: block; min-width: 0; }
 
       .wrap {
         position: relative;
@@ -112,6 +113,10 @@ class VanCtlSelect extends LitElement {
       }
       select:focus {
         border-color: var(--primary-color);
+      }
+      select:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
       }
 
       .wrap.add select {
