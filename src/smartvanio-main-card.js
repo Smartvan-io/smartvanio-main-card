@@ -2346,7 +2346,7 @@ class VanCtlHmiCard extends LitElement {
     const domain = target_entity_id.split(".")[0];
     const label = this._label(entity_id);
     const gestureName =
-      { press: "Press", double_press: "Double Press", hold: "Hold" }[gesture] ??
+      { press: "Press", double_press: "Double Press", hold: "Hold", above: `Above ${extra.threshold ?? ''}`, below: `Below ${extra.threshold ?? ''}` }[gesture] ??
       gesture;
     const description = JSON.stringify({
       smartvanio: true,
@@ -2432,6 +2432,20 @@ class VanCtlHmiCard extends LitElement {
       return {
         ...base,
         triggers: [{ trigger: "state", entity_id, from: "on", to: "off" }],
+        actions: svcActions,
+      };
+    }
+    if (gesture === "above") {
+      return {
+        ...base,
+        triggers: [{ trigger: "numeric_state", entity_id, above: parseFloat(extra.threshold ?? 0) }],
+        actions: svcActions,
+      };
+    }
+    if (gesture === "below") {
+      return {
+        ...base,
+        triggers: [{ trigger: "numeric_state", entity_id, below: parseFloat(extra.threshold ?? 0) }],
         actions: svcActions,
       };
     }
@@ -2913,6 +2927,7 @@ class VanCtlHmiCard extends LitElement {
                 action: meta.action ?? "",
                 duration: meta.duration ?? "",
                 brightness_pct: meta.brightness_pct ?? "",
+                threshold: meta.threshold ?? "",
               });
               origIds[configKey] = configKey;
             }
@@ -3047,8 +3062,14 @@ class VanCtlHmiCard extends LitElement {
       if (rows?.length || Object.keys(this._editOriginalIds ?? {}).length) {
         const savedKeys = new Set();
         for (const row of (rows ?? [])) {
+          const isSensorRow = domain === "sensor";
+          // For sensors, auto-set the source entity to the entity being edited
+          if (isSensorRow) {
+            row.source_entity_id = entity_id;
+            if (!row.gesture) row.gesture = "above";
+          }
           // Auto-default gesture for buttons if not set
-          if (row.source_entity_id && !row.gesture) {
+          if (!isSensorRow && row.source_entity_id && !row.gesture) {
             const srcDomain = row.source_entity_id.split(".")[0];
             if (srcDomain === "binary_sensor" || srcDomain === "button") row.gesture = "press";
             else if (srcDomain === "switch" || srcDomain === "light" || srcDomain === "fan") row.gesture = "off_to_on";
@@ -3056,6 +3077,7 @@ class VanCtlHmiCard extends LitElement {
           const missing = [];
           if (!row.source_entity_id) missing.push("trigger");
           if (!row.gesture) missing.push("event");
+          if (isSensorRow && (row.threshold === undefined || row.threshold === '')) missing.push("threshold value");
           if (!row.target_entity_id) missing.push("target");
           if (!row.action) missing.push("action");
           if (missing.length) {
@@ -3069,6 +3091,7 @@ class VanCtlHmiCard extends LitElement {
           const extra = {};
           if (row.duration) extra.duration = row.duration;
           if (row.brightness_pct) extra.brightness_pct = row.brightness_pct;
+          if (row.threshold !== undefined) extra.threshold = row.threshold;
           const cfg = this._buildAutomationConfig(
             row.source_entity_id,
             row.gesture,
@@ -3151,26 +3174,10 @@ class VanCtlHmiCard extends LitElement {
             retain: true,
           });
 
-          // Clear pattern preview and send real segment_set commands
-          await this.hass.callService("mqtt", "publish", {
-            topic: `${deviceId}/light/${channel}/pattern_set`,
-            payload: JSON.stringify({ stops: [] }),
-          });
-          // Send segment_set commands to firmware so it registers the config
-          this._sendSegmentsToStrip(lightSegments ?? []);
-          // Update state so close doesn't revert — strip should show saved segments
+          // Segments saved to MQTT — revert the physical strip to its pre-modal state
           this._initialSegments = (lightSegments ?? []).map(s => ({ ...s }));
           this._lightSegments = (lightSegments ?? []).map(s => ({ ...s }));
-          this._modalOpenState = null;
-          this._activePatterns?.delete(entity_id);
-          // If the light was off before editing, turn it back off after segments land
-          if (this._previewTurnedOn) {
-            setTimeout(() => {
-              const call = this.hass.callService('light', 'turn_off', {
-                entity_id: entity_id,
-              });
-            }, 500);
-          }
+          this._restoreOnCancel();
 
           // Delete removed segment entities from HA registry
           const remainingIds = new Set((lightSegments ?? []).map((s) =>
@@ -3550,7 +3557,6 @@ class VanCtlHmiCard extends LitElement {
 
             const editEid = isSegment ? (state?.attributes?.smartvanio_parent_entity_id ?? eid) : eid;
 
-            const sliderColor = curRgb ? `rgb(${curRgb.join(',')})` : 'var(--sv-accent)';
             const liveBri = (this._lpBriLocal?.eid === eid) ? this._lpBriLocal.pct : bri;
             // Check for active pattern (optimistic or from HA state)
             let tilePatternGrad = null;
@@ -3561,7 +3567,9 @@ class VanCtlHmiCard extends LitElement {
               patternStops = pats[activePatName];
               if (patternStops) tilePatternGrad = this._patternGradientCSS(patternStops);
             }
-            const iconColor = unavail ? 'var(--sv-red)' : isOn && patternStops?.length ? `rgb(${patternStops[0].r},${patternStops[0].g},${patternStops[0].b})` : isOn && curRgb ? `rgb(${curRgb.join(',')})` : isOn ? 'var(--sv-accent)' : 'var(--sv-text-secondary)';
+            const patFirstColor = patternStops?.length ? `rgb(${patternStops[0].r},${patternStops[0].g},${patternStops[0].b})` : null;
+            const sliderColor = patFirstColor || (curRgb ? `rgb(${curRgb.join(',')})` : 'var(--sv-accent)');
+            const iconColor = unavail ? 'var(--sv-red)' : isOn && patFirstColor ? patFirstColor : isOn && curRgb ? `rgb(${curRgb.join(',')})` : isOn ? 'var(--sv-accent)' : 'var(--sv-text-secondary)';
             return html`
               <div class="lp-row ${isOn ? 'on' : ''} ${unavail ? 'unavail' : ''}"
                    @pointerdown=${(e) => {
@@ -4096,6 +4104,7 @@ class VanCtlHmiCard extends LitElement {
                 action: meta.action ?? "",
                 duration: meta.duration ?? "",
                 brightness_pct: meta.brightness_pct ?? "",
+                threshold: meta.threshold ?? "",
               });
               origIds[configKey] = configKey;
             }
@@ -6514,7 +6523,7 @@ class VanCtlHmiCard extends LitElement {
       <div class="hmi">
         <!-- Top bar -->
         <div class="top-bar">
-          <span class="tb-greeting">${greeting} <span style="font-size:10px;opacity:0.4;font-weight:400">v124</span></span>
+          <span class="tb-greeting">${greeting} <span style="font-size:10px;opacity:0.4;font-weight:400">v140</span></span>
           <div class="tb-stats">
             ${topbarStats.length ? topbarStats.map(({entity, name, icon}, i) => {
               const st = this.hass.states[entity];
@@ -6649,6 +6658,7 @@ class VanCtlHmiCard extends LitElement {
                 ?is-switch=${this._editingEntity.startsWith("switch.")}
                 ?is-light=${this._editingEntity.startsWith("light.") && this._isSmartvanioLight(this._editingEntity)}
                 ?is-tank=${this._editingEntity.startsWith("sensor.") && (this.hass.states[this._editingEntity]?.attributes?.device_class === "volume" || this._editingEntity.includes("tank"))}
+                ?is-sensor=${this._editingEntity.startsWith("sensor.")}
                 .lightSegments=${this._lightSegments}
                 .lightPatterns=${this._lightPatterns}
                 .entityPatterns=${this._getEntityPatterns(this._editingEntity)}

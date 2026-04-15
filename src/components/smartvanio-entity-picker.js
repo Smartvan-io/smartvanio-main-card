@@ -132,6 +132,35 @@ class SmartVanEntityPicker extends LitElement {
     return val;
   }
 
+  _toggleOpen() {
+    this._open = !this._open;
+    this._search = "";
+    if (this._open) {
+      requestAnimationFrame(() => this._positionDropdown());
+    }
+  }
+
+  _positionDropdown() {
+    const sel = this.shadowRoot?.querySelector('.selected');
+    const dd = this.shadowRoot?.querySelector('.dropdown');
+    if (!sel || !dd) return;
+    const rect = sel.getBoundingClientRect();
+    dd.style.left = `${rect.left}px`;
+    dd.style.width = `${rect.width}px`;
+    // Check if dropdown fits below, otherwise open above
+    const spaceBelow = window.innerHeight - rect.bottom - 8;
+    const ddHeight = Math.min(300, dd.scrollHeight);
+    if (spaceBelow >= ddHeight || spaceBelow >= rect.top) {
+      dd.style.top = `${rect.bottom + 4}px`;
+      dd.style.bottom = 'auto';
+      dd.style.maxHeight = `${Math.min(300, spaceBelow)}px`;
+    } else {
+      dd.style.bottom = `${window.innerHeight - rect.top + 4}px`;
+      dd.style.top = 'auto';
+      dd.style.maxHeight = `${Math.min(300, rect.top - 8)}px`;
+    }
+  }
+
   render() {
     const selected = this.value ? this.hass?.states?.[this.value] : null;
     const selName = selected?.attributes?.friendly_name ?? (this.value ? this.value.split(".").pop().replace(/_/g, " ") : "");
@@ -140,7 +169,7 @@ class SmartVanEntityPicker extends LitElement {
 
     return html`
       <div class="picker">
-        <div class="selected" @click=${() => { this._open = !this._open; this._search = ""; }}>
+        <div class="selected" @click=${() => this._toggleOpen()}>
           ${this.value ? html`
             <ha-icon class="sel-icon" icon="${selIcon}" style="--mdc-icon-size:18px"></ha-icon>
             <span class="sel-name">${selName}</span>
@@ -235,15 +264,15 @@ class SmartVanEntityPicker extends LitElement {
       }
 
       .dropdown {
-        position: absolute;
-        top: calc(100% + 4px);
-        left: 0; right: 0;
-        z-index: 200;
+        position: fixed;
+        z-index: 10000;
         background: var(--sv-bg-elevated, #1E1E2A);
         border: 1px solid var(--sv-border, rgba(255,255,255,0.08));
         border-radius: 8px;
         box-shadow: 0 8px 24px rgba(0,0,0,0.5);
         overflow: hidden;
+        display: flex;
+        flex-direction: column;
       }
 
       .search {
@@ -261,8 +290,9 @@ class SmartVanEntityPicker extends LitElement {
       .search::placeholder { color: var(--sv-text-secondary, #888); }
 
       .list {
-        max-height: 240px;
+        flex: 1;
         overflow-y: auto;
+        min-height: 0;
       }
       .list::-webkit-scrollbar { width: 4px; }
       .list::-webkit-scrollbar-thumb { background: var(--sv-border, #333); border-radius: 2px; }

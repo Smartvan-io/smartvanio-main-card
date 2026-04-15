@@ -19,6 +19,7 @@ class VanCtlModalEdit extends LitElement {
       _areaPickerOpen:  { type: Boolean, state: true },
       _areaFilter:      { type: String, state: true },
       _selectedSegIdx:  { type: Number, state: true },
+      _dragRemoveIdx:   { type: Number, state: true },
       _ledTab:          { type: String, state: true },
       _rightTab:        { type: String, state: true },
       _modalView:       { type: String, state: true }, // 'control' | 'settings'
@@ -41,6 +42,7 @@ class VanCtlModalEdit extends LitElement {
       isSwitch:         { type: Boolean, attribute: "is-switch" },
       isTank:           { type: Boolean, attribute: "is-tank" },
       isLight:          { type: Boolean, attribute: "is-light" },
+      isSensor:         { type: Boolean, attribute: "is-sensor" },
       targetEntities:   { type: Array },
       sourceEntities:   { type: Array },
     };
@@ -467,10 +469,33 @@ class VanCtlModalEdit extends LitElement {
               const width = ((seg.end - seg.start + 1) / max) * 100;
               const isSelected = sel === i;
               return html`
-                <div class="strip-seg ${isSelected ? 'selected' : ''}"
+                <div class="strip-seg ${isSelected ? 'selected' : ''} ${this._dragRemoveIdx === i ? 'drag-removing' : ''}"
                   style="left:${left}%;width:${width}%;background:rgba(${seg.r},${seg.g},${seg.b},${(seg.brightness ?? 100) / 100})"
-                  @click=${(e) => { e.stopPropagation(); this._selectedSegIdx = i; this.requestUpdate(); }}>
+                  @click=${(e) => {
+                    e.stopPropagation();
+                    if (this._segLpFired) { this._segLpFired = false; return; }
+                    this._selectedSegIdx = i;
+                    this.requestUpdate();
+                    // Open color picker for this segment
+                    const input = e.currentTarget.querySelector('.strip-seg-color');
+                    if (input) input.click();
+                  }}
+                  @pointerdown=${(e) => {
+                    if (e.target.closest('.strip-handle')) return;
+                    this._segLpFired = false;
+                    this._segLpTimer = setTimeout(() => {
+                      this._segLpTimer = null;
+                      this._segLpFired = true;
+                      this._startSegDragRemove(e, i);
+                    }, 400);
+                  }}
+                  @pointerup=${() => { if (this._segLpTimer) { clearTimeout(this._segLpTimer); this._segLpTimer = null; } }}
+                  @pointerleave=${() => { if (this._segLpTimer) { clearTimeout(this._segLpTimer); this._segLpTimer = null; } }}>
                   <span class="strip-seg-label">${seg.name || `${seg.start}-${seg.end}`}</span>
+                  <input type="color" class="strip-seg-color"
+                    .value=${rgbToHex(seg.r, seg.g, seg.b)}
+                    @click=${(e) => e.stopPropagation()}
+                    @input=${(e) => { e.stopPropagation(); this._emitSegUpdate(i, "color", e.target.value); }} />
                   <!-- Left drag handle -->
                   <div class="strip-handle strip-handle-l"
                     @pointerdown=${(e) => this._onHandleDrag(e, i, 'start', segs, max)}></div>
@@ -493,33 +518,12 @@ class VanCtlModalEdit extends LitElement {
         ${selectedSeg ? html`
           <div class="seg-detail">
             <div class="seg-detail-row">
-              <input type="color" class="seg-color-input"
-                .value=${rgbToHex(selectedSeg.r, selectedSeg.g, selectedSeg.b)}
-                @input=${(e) => this._emitSegUpdate(sel, "color", e.target.value)} />
               <input type="text" class="modal-input seg-name-input" placeholder="Segment name"
                 .value=${selectedSeg.name}
                 @input=${(e) => this._emitSegUpdate(sel, "name", e.target.value)} />
               <button class="delete-row-btn" @click=${() => { this._selectedSegIdx = null; this._emit("smartvanio-remove-segment", { id: selectedSeg.id ?? sel }); }}>
                 <ha-icon icon="mdi:delete-outline"></ha-icon>
               </button>
-            </div>
-            <div class="seg-detail-row">
-              <div class="seg-field">
-                <span class="seg-field-label">Start</span>
-                <input type="number" class="cal-input" min="0" .value=${String(selectedSeg.start ?? 0)}
-                  @change=${(e) => this._emitSegUpdate(sel, "start", Math.max(0, +e.target.value))} />
-              </div>
-              <div class="seg-field">
-                <span class="seg-field-label">End</span>
-                <input type="number" class="cal-input" min="0" .value=${String(selectedSeg.end ?? 0)}
-                  @change=${(e) => this._emitSegUpdate(sel, "end", Math.max(0, +e.target.value))} />
-              </div>
-              <div class="seg-field">
-                <span class="seg-field-label">Brightness</span>
-                <input type="number" class="cal-input" min="1" max="100" .value=${String(selectedSeg.brightness ?? 100)}
-                  @change=${(e) => this._emitSegUpdate(sel, "brightness", Math.max(1, Math.min(100, +e.target.value)))} />
-                <span class="seg-bri-unit">%</span>
-              </div>
             </div>
           </div>
         ` : html`
@@ -531,10 +535,15 @@ class VanCtlModalEdit extends LitElement {
           <div class="seg-list">
             ${segs.map((s, i) => html`
               <div class="seg-list-item ${sel === i ? 'active' : ''}" @click=${() => { this._selectedSegIdx = i; this.requestUpdate(); }}>
-                <span class="seg-list-swatch" style="background:rgb(${s.r},${s.g},${s.b})"></span>
+                <label class="seg-list-swatch-label">
+                  <span class="seg-list-swatch" style="background:rgb(${s.r},${s.g},${s.b})"></span>
+                  <input type="color" class="seg-list-color-input"
+                    .value=${rgbToHex(s.r, s.g, s.b)}
+                    @click=${(e) => e.stopPropagation()}
+                    @input=${(e) => { e.stopPropagation(); this._emitSegUpdate(i, "color", e.target.value); }} />
+                </label>
                 <span class="seg-list-name">${s.name || `Segment ${i + 1}`}</span>
                 <span class="seg-list-range">${s.start}–${s.end}</span>
-                <span class="seg-list-bri">${s.brightness ?? 100}%</span>
                 <button class="seg-list-del" @click=${(e) => { e.stopPropagation(); if (sel === i) this._selectedSegIdx = null; this._emit("smartvanio-remove-segment", { id: s.id ?? i }); }}>
                   <ha-icon icon="mdi:close" style="--mdc-icon-size:14px"></ha-icon>
                 </button>
@@ -544,6 +553,47 @@ class VanCtlModalEdit extends LitElement {
         ` : ''}
       </div>
     `;
+  }
+
+  _startSegDragRemove(e, idx) {
+    const seg = e.currentTarget;
+    const startY = e.clientY;
+    this._dragRemoveIdx = idx;
+    seg.setPointerCapture(e.pointerId);
+
+    const onMove = (ev) => {
+      const dy = ev.clientY - startY;
+      if (dy > 60) {
+        seg.style.transform = `translateY(${dy}px)`;
+        seg.style.opacity = Math.max(0, 1 - (dy - 60) / 60).toString();
+      } else {
+        seg.style.transform = `translateY(${Math.max(0, dy)}px)`;
+        seg.style.opacity = '1';
+      }
+    };
+
+    const onUp = (ev) => {
+      seg.removeEventListener('pointermove', onMove);
+      seg.removeEventListener('pointerup', onUp);
+      seg.removeEventListener('pointercancel', onUp);
+      seg.releasePointerCapture(ev.pointerId);
+      seg.style.transform = '';
+      seg.style.opacity = '';
+      this._dragRemoveIdx = null;
+
+      const dy = ev.clientY - startY;
+      if (dy > 80) {
+        // Dragged down far enough — remove
+        if (this._selectedSegIdx === idx) this._selectedSegIdx = null;
+        const segs = this.lightSegments ?? [];
+        this._emit("smartvanio-remove-segment", { id: segs[idx]?.id ?? idx });
+      }
+      this.requestUpdate();
+    };
+
+    seg.addEventListener('pointermove', onMove);
+    seg.addEventListener('pointerup', onUp);
+    seg.addEventListener('pointercancel', onUp);
   }
 
   _emitSegUpdate(idx, field, value) {
@@ -640,7 +690,16 @@ class VanCtlModalEdit extends LitElement {
 
   // ─── Pattern gradient editor ───────────────────────────────────
 
-  get _maxPos() { return Math.max(1, (this.maxLeds || 100) - 1); }
+  get _maxPos() { return Math.max(1, this.maxLeds || 100); }
+
+  /** Rescale stop positions so they span 0 → _maxPos, preserving relative spacing. */
+  _normalizeStops(stops) {
+    if (!stops?.length) return stops;
+    const srcMax = Math.max(1, ...stops.map(s => s.pos));
+    const dstMax = this._maxPos;
+    if (srcMax === dstMax) return stops;
+    return stops.map(s => ({ ...s, pos: Math.round(s.pos / srcMax * dstMax) }));
+  }
 
   _initPatternStops() {
     if (!this._patternStops) {
@@ -653,7 +712,7 @@ class VanCtlModalEdit extends LitElement {
       }
       const activeStops = activePatName ? (this.entityPatterns ?? {})[activePatName] : null;
       if (activeStops?.length) {
-        this._patternStops = [...activeStops];
+        this._patternStops = this._normalizeStops([...activeStops]);
         this._editingPatternName = activePatName;
         // Don't preview — strip already shows this pattern
       } else {
@@ -671,11 +730,11 @@ class VanCtlModalEdit extends LitElement {
 
   _gradientCSS(stops) {
     if (!stops?.length) return 'linear-gradient(to right, #333, #333)';
-    const max = this._maxPos;
     const sorted = [...stops].sort((a, b) => a.pos - b.pos);
+    const max = this._maxPos;
     const parts = sorted.map(s => {
       const bri = (s.brightness ?? 100) / 100;
-      return `rgb(${Math.round(s.r * bri)},${Math.round(s.g * bri)},${Math.round(s.b * bri)}) ${max > 0 ? (s.pos / max * 100) : 0}%`;
+      return `rgb(${Math.round(s.r * bri)},${Math.round(s.g * bri)},${Math.round(s.b * bri)}) ${(s.pos / max * 100).toFixed(1)}%`;
     });
     return `linear-gradient(to right, ${parts.join(', ')})`;
   }
@@ -688,126 +747,158 @@ class VanCtlModalEdit extends LitElement {
     const selectedStop = sel !== null && sel !== undefined && stops[sel] ? stops[sel] : null;
     const patterns = this.lightPatterns ?? {};
     const patternNames = Object.keys(patterns);
-    const eid = this.entityId;
-    let activePatName = null;
-    if (this.activePattern?.startsWith(eid + ':')) {
-      activePatName = this.activePattern.slice(eid.length + 1);
-    }
-
-    const sorted = [...stops].map((s, i) => ({ ...s, _idx: i })).sort((a, b) => a.pos - b.pos);
+    const currentName = this._editingPatternName ?? '';
 
     return html`
-      <div class="modal-section">
-        <div class="modal-section-header">
-          <span class="modal-label">Gradient Pattern</span>
-        </div>
+      <div class="modal-section pat-section">
 
-        <!-- Gradient bar with stop handles -->
-        <div class="pattern-editor">
-          <div class="pattern-bar-wrap">
-            <div class="pattern-bar" style="background:${this._gradientCSS(stops)}"
-              @click=${(e) => this._onPatternStripClick(e, stops)}>
-            </div>
-            <div class="pattern-stops-track"
-              @click=${(e) => this._onPatternStripClick(e, stops)}>
-              ${stops.map((stop, i) => {
-                const isSelected = sel === i;
-                return html`
-                  <div class="pattern-stop ${isSelected ? 'selected' : ''}"
-                    style="left:${max > 0 ? (stop.pos / max * 100) : 0}%"
-                    @click=${(e) => { e.stopPropagation(); this._selectedStopIdx = i; this.requestUpdate(); }}
-                    @pointerdown=${(e) => this._onStopDrag(e, i, stops)}>
-                    <div class="stop-arrow" style="border-bottom-color:rgb(${stop.r},${stop.g},${stop.b})"></div>
-                    <div class="stop-swatch" style="background:rgb(${stop.r},${stop.g},${stop.b})"></div>
-                  </div>
-                `;
-              })}
-            </div>
+        <!-- Gradient preview + stop handles (cssgradient.io style) -->
+        <div class="pat-editor">
+          <div class="pat-bar-wrap">
+            <!-- Checkerboard background -->
+            <div class="pat-bar-bg"></div>
+            <!-- Gradient overlay -->
+            <div class="pat-bar" style="background:${this._gradientCSS(stops)}"
+              @click=${(e) => this._onPatternStripClick(e, stops)}></div>
+          </div>
+          <!-- Stop handles below the bar -->
+          <div class="pat-handle-track"
+            @click=${(e) => this._onPatternStripClick(e, stops)}>
+            ${stops.map((stop, i) => {
+              const pct = max > 0 ? (stop.pos / max * 100) : 0;
+              const isSelected = sel === i;
+              return html`
+                <div class="pat-handle ${isSelected ? 'selected' : ''}"
+                  style="left:${pct}%"
+                  @click=${(e) => { e.stopPropagation(); this._selectedStopIdx = i; this.requestUpdate(); }}
+                  @pointerdown=${(e) => this._onStopDrag(e, i, stops)}>
+                  <div class="pat-handle-arrow"></div>
+                  <div class="pat-handle-color" style="background:rgb(${stop.r},${stop.g},${stop.b})"></div>
+                </div>
+              `;
+            })}
           </div>
         </div>
 
-        <!-- Stops list -->
-        <div class="pattern-stop-list">
-          ${sorted.map(stop => {
-            const i = stop._idx;
-            const isSelected = sel === i;
-            return html`
-              <div class="pattern-stop-row ${isSelected ? 'selected' : ''}"
-                @click=${() => { this._selectedStopIdx = i; this.requestUpdate(); }}>
-                <input type="color" class="pattern-stop-color"
-                  .value=${rgbToHex(stop.r, stop.g, stop.b)}
-                  @input=${(e) => this._updateStop(i, 'color', e.target.value)}
-                  @click=${(e) => e.stopPropagation()} />
-                <input type="number" class="pattern-stop-pos" min="0" max="${max}"
-                  .value=${String(stop.pos)}
-                  @change=${(e) => { e.stopPropagation(); this._updateStop(i, 'pos', Math.max(0, Math.min(max, +e.target.value))); }}
-                  @click=${(e) => e.stopPropagation()} />
-                <input type="range" class="pattern-stop-bri" min="0" max="100"
-                  .value=${String(stop.brightness ?? 100)}
-                  @input=${(e) => { e.stopPropagation(); this._updateStop(i, 'brightness', +e.target.value); }}
-                  @click=${(e) => e.stopPropagation()} />
-                <span class="pattern-stop-bri-label">${stop.brightness ?? 100}%</span>
-                <button class="pattern-stop-del" ?disabled=${stops.length <= 2} @click=${(e) => {
-                  e.stopPropagation();
-                  if (stops.length <= 2) return;
-                  this._patternStops = stops.filter((_, j) => j !== i);
-                  if (sel === i) this._selectedStopIdx = null;
-                  else if (sel > i) this._selectedStopIdx = sel - 1;
-                  this._emit("smartvanio-pattern-preview", { stops: this._patternStops });
-                  this.requestUpdate();
-                }}>
-                  <ha-icon icon="mdi:close" style="--mdc-icon-size:14px"></ha-icon>
-                </button>
-              </div>
-            `;
-          })}
-        </div>
+        <!-- Selected stop controls -->
+        ${selectedStop ? html`
+          <div class="pat-stop-ctrl">
+            <label class="pat-color-label">
+              <div class="pat-color-preview" style="background:rgb(${selectedStop.r},${selectedStop.g},${selectedStop.b})"></div>
+              <input type="color" class="pat-color-input"
+                .value=${rgbToHex(selectedStop.r, selectedStop.g, selectedStop.b)}
+                @input=${(e) => this._updateStop(sel, 'color', e.target.value)} />
+            </label>
+            <div class="pat-hex-wrap">
+              <span class="pat-field-label">Hex</span>
+              <input type="text" class="pat-hex-input"
+                .value=${rgbToHex(selectedStop.r, selectedStop.g, selectedStop.b)}
+                @change=${(e) => {
+                  const v = e.target.value.replace(/[^0-9a-fA-F]/g, '').slice(0, 6);
+                  if (v.length === 6) this._updateStop(sel, 'color', '#' + v);
+                }} />
+            </div>
+            <div class="pat-pos-wrap">
+              <span class="pat-field-label">LED</span>
+              <input type="number" class="pat-pos-input" min="0" max="${max}"
+                .value=${String(selectedStop.pos)}
+                @change=${(e) => this._updateStop(sel, 'pos', Math.max(0, Math.min(max, +e.target.value)))} />
+            </div>
+            <button class="pat-stop-del" ?disabled=${stops.length <= 2} @click=${() => {
+              if (stops.length <= 2) return;
+              this._patternStops = stops.filter((_, j) => j !== sel);
+              this._selectedStopIdx = null;
+              this._emit("smartvanio-pattern-preview", { stops: this._patternStops });
+              this.requestUpdate();
+            }}>
+              <ha-icon icon="mdi:delete-outline" style="--mdc-icon-size:18px"></ha-icon>
+            </button>
+          </div>
+        ` : html`
+          <div class="pat-hint">Tap the gradient bar to add a color stop</div>
+        `}
 
         <!-- Save pattern -->
-        <div class="pattern-save-row">
-          <input type="text" class="modal-input pattern-name-input" placeholder="Pattern name…"
-            .value=${this._editingPatternName ?? ''}
+        <div class="pat-save-row">
+          <input type="text" class="modal-input pat-name-input" placeholder="Pattern name…"
+            .value=${currentName}
             @input=${(e) => { this._editingPatternName = e.target.value; }} />
-          <button class="modal-btn save pattern-save-btn"
-            ?disabled=${!this._editingPatternName?.trim() || stops.length < 2}
+          <button class="modal-btn save pat-save-btn"
+            ?disabled=${!currentName.trim() || stops.length < 2}
             @click=${() => {
-              const name = this._editingPatternName?.trim();
+              const name = currentName.trim();
               if (!name || stops.length < 2) return;
               this._emit("smartvanio-save-pattern", { name, stops: stops });
-              this._editingPatternName = '';
             }}>Save</button>
         </div>
 
         <!-- Saved patterns list -->
         ${patternNames.length ? html`
-          <div class="seg-list">
-            ${patternNames.map(name => html`
-              <div class="seg-list-item ${name === activePatName ? 'active' : ''}" @click=${() => {
-                this._patternStops = [...patterns[name]];
-                this._editingPatternName = name;
-                this._selectedStopIdx = null;
-                this._emit("smartvanio-pattern-preview", { stops: patterns[name] });
-                this.requestUpdate();
-              }}>
-                <span class="seg-list-swatch" style="background:${this._gradientCSS(patterns[name])};width:40px"></span>
-                <span class="seg-list-name">${name}</span>
-                <button class="seg-list-del" @click=${(e) => {
-                  e.stopPropagation();
-                  this._emit("smartvanio-delete-pattern", { name });
+          <div class="pat-list">
+            ${patternNames.map(name => {
+              const isCurrent = name === currentName;
+              return html`
+                <div class="pat-list-item ${isCurrent ? 'active' : ''}" @click=${() => {
+                  this._patternStops = this._normalizeStops([...patterns[name]]);
+                  this._editingPatternName = name;
+                  this._selectedStopIdx = null;
+                  this._emit("smartvanio-pattern-preview", { stops: this._patternStops });
+                  this.requestUpdate();
                 }}>
-                  <ha-icon icon="mdi:close" style="--mdc-icon-size:14px"></ha-icon>
-                </button>
-              </div>
-            `)}
+                  <span class="pat-list-grad" style="background:${this._gradientCSS(this._normalizeStops(patterns[name]))}"></span>
+                  <span class="pat-list-name">${name}</span>
+                  <button class="pat-list-del" @click=${(e) => {
+                    e.stopPropagation();
+                    this._emit("smartvanio-delete-pattern", { name });
+                  }}>
+                    <ha-icon icon="mdi:close" style="--mdc-icon-size:14px"></ha-icon>
+                  </button>
+                </div>
+              `;
+            })}
           </div>
         ` : ''}
+
+        <!-- Add new pattern button -->
+        <button class="pat-add-btn" @click=${() => this._newRandomPattern()}>
+          <ha-icon icon="mdi:plus" style="--mdc-icon-size:18px"></ha-icon>
+          Add Pattern
+        </button>
       </div>
     `;
   }
 
+  _newRandomPattern() {
+    const max = this._maxPos;
+    // Random nebula palette — pick 5 random colors from a cosmic range
+    const nebula = [
+      [75, 0, 130],    [138, 43, 226],  [23, 13, 89],    [199, 21, 133],
+      [25, 25, 112],   [72, 61, 139],   [148, 0, 211],   [186, 85, 211],
+      [255, 20, 147],  [0, 0, 139],     [65, 105, 225],  [30, 144, 255],
+      [0, 191, 255],   [123, 104, 238], [218, 112, 214], [255, 0, 255],
+      [75, 0, 180],    [100, 0, 150],   [0, 50, 120],    [180, 50, 200],
+    ];
+    const pick = () => nebula[Math.floor(Math.random() * nebula.length)];
+    const count = 4 + Math.floor(Math.random() * 3); // 4–6 stops
+    const stops = [];
+    for (let i = 0; i < count; i++) {
+      const [r, g, b] = pick();
+      stops.push({
+        pos: Math.round((i / (count - 1)) * max),
+        r, g, b,
+        brightness: 70 + Math.floor(Math.random() * 31),
+      });
+    }
+    this._patternStops = stops;
+    this._editingPatternName = '';
+    this._selectedStopIdx = null;
+    this._emit("smartvanio-pattern-preview", { stops });
+    this.requestUpdate();
+  }
+
   _onPatternStripClick(e, stops) {
-    const wrap = e.target.closest('.pattern-bar-wrap');
-    const rect = (wrap || e.currentTarget).getBoundingClientRect();
+    const track = e.target.closest('.pat-editor')?.querySelector('.pat-handle-track');
+    const rect = (track || e.currentTarget).getBoundingClientRect();
     const x = e.clientX - rect.left;
     const max = this._maxPos;
     const pos = Math.round((x / rect.width) * max);
@@ -837,14 +928,29 @@ class VanCtlModalEdit extends LitElement {
   _onStopDrag(e, stopIdx, stops) {
     e.stopPropagation();
     e.preventDefault();
-    const bar = e.target.closest('.pattern-bar-wrap');
-    const barRect = bar.getBoundingClientRect();
+    const wrap = e.target.closest('.pat-editor');
+    const track = wrap?.querySelector('.pat-handle-track');
+    const trackRect = (track || wrap).getBoundingClientRect();
     this._selectedStopIdx = stopIdx;
+    const startY = e.clientY;
+    let removedByDrag = false;
 
     const max = this._maxPos;
     const onMove = (ev) => {
-      const x = ev.clientX - barRect.left;
-      let pos = Math.round((x / barRect.width) * max);
+      const dy = Math.abs(ev.clientY - startY);
+      // If dragged far off vertically and more than 2 stops, remove it
+      if (dy > 80 && stops.length > 2) {
+        if (!removedByDrag) {
+          removedByDrag = true;
+          this._patternStops = stops.filter((_, j) => j !== stopIdx);
+          this._selectedStopIdx = null;
+          this._emit("smartvanio-pattern-preview", { stops: this._patternStops });
+          this.requestUpdate();
+        }
+        return;
+      }
+      const x = ev.clientX - trackRect.left;
+      let pos = Math.round((x / trackRect.width) * max);
       pos = Math.max(0, Math.min(max, pos));
       const updated = [...this._patternStops];
       updated[stopIdx] = { ...updated[stopIdx], pos };
@@ -977,12 +1083,15 @@ class VanCtlModalEdit extends LitElement {
   render() {
     if (!this.entityId) return html``;
     const entity_id = this.entityId;
-    const label = this.hass?.entities?.[entity_id]?.name ||
-      this.hass?.states[entity_id]?.attributes?.friendly_name ||
-      entity_id.split(".").pop();
     const haDeviceId = this.hass?.entities?.[entity_id]?.device_id;
     const haDevice = haDeviceId ? this.hass?.devices?.[haDeviceId] : null;
     const deviceName = haDevice?.name_by_user ?? haDevice?.name ?? null;
+    const override = this.hass?.entities?.[entity_id]?.name;
+    const friendly = this.hass?.states[entity_id]?.attributes?.friendly_name ?? '';
+    // Strip device name prefix from friendly_name (same as main card _label)
+    const label = override || (deviceName && friendly.startsWith(deviceName + ' ')
+      ? friendly.slice(deviceName.length + 1)
+      : friendly || entity_id.split('.').pop());
 
     const view = this._modalView ?? (this.isLight ? 'control' : 'settings');
 
@@ -1043,9 +1152,15 @@ class VanCtlModalEdit extends LitElement {
                     ${this.isLight ? html`
                       <div class="right-tabs">
                         <button class="right-tab ${(this._rightTab ?? 'segments') === 'segments' ? 'active' : ''}"
-                          @click=${() => { this._rightTab = 'segments'; }}>Segments</button>
+                          @click=${() => { this._rightTab = 'segments'; this._emit("smartvanio-segment-preview"); }}>Segments</button>
                         <button class="right-tab ${this._rightTab === 'patterns' ? 'active' : ''}"
-                          @click=${() => { this._rightTab = 'patterns'; }}>Patterns</button>
+                          @click=${() => {
+                            this._rightTab = 'patterns';
+                            // Re-apply pattern preview to strip (may have been showing segments)
+                            if (this._patternStops?.length) {
+                              this._emit("smartvanio-pattern-preview", { stops: this._patternStops });
+                            }
+                          }}>Patterns</button>
                         <button class="right-tab ${this._rightTab === 'automations' ? 'active' : ''}"
                           @click=${() => { this._rightTab = 'automations'; }}>Automations</button>
                       </div>
@@ -1054,7 +1169,73 @@ class VanCtlModalEdit extends LitElement {
                         : this._rightTab === 'patterns'
                           ? this._renderPatternsSection()
                           : this._renderAutomationsSection()}
-                    ` : html`
+                    ` : this.isSensor ? html`
+                    <!-- Simplified sensor automation: value above/below threshold → target → action -->
+                    <div class="modal-section">
+                      <div class="modal-section-header">
+                        <span class="modal-label">Automations</span>
+                        <button class="add-row-btn" @click=${() => this._emit("smartvanio-add-edit-row")}>
+                          <ha-icon icon="mdi:plus"></ha-icon> Add
+                        </button>
+                      </div>
+                      ${!(this.editRows ?? []).length
+                        ? html`<div class="no-automations">No automations yet — click Add to create one.</div>`
+                        : ""}
+                      ${(this.editRows ?? []).map(
+                        (row, i) => html`
+                          <div class="automation-row-v2">
+                            <div class="auto-row-condition">
+                              <span class="auto-row-label-text">When value is</span>
+                              <div class="sensor-condition-row">
+                                <smartvanio-select
+                                  .value=${row.gesture || 'above'}
+                                  .options=${[
+                                    { value: 'above', label: 'Above' },
+                                    { value: 'below', label: 'Below' },
+                                  ]}
+                                  @smartvanio-change=${(e) => this._emit("smartvanio-update-edit-row", { id: i, field: "gesture", value: e.detail.value })}
+                                ></smartvanio-select>
+                                <input type="number" class="sensor-threshold-input"
+                                  placeholder="Value"
+                                  .value=${row.threshold ?? ''}
+                                  @input=${(e) => this._emit("smartvanio-update-edit-row", { id: i, field: "threshold", value: e.target.value })} />
+                              </div>
+                            </div>
+                            <div class="auto-row-target">
+                              <span class="auto-row-label-text">Target</span>
+                              <smartvanio-entity-picker
+                                .hass=${this.hass}
+                                .value=${row.target_entity_id}
+                                .domains=${["light", "switch", "fan", "scene", "cover", "lock"]}
+                                pinned-entity=${this.entityId}
+                                placeholder="Select target…"
+                                @smartvanio-change=${(e) => this._emit("smartvanio-update-edit-row", { id: i, field: "target_entity_id", value: e.detail.value })}
+                              ></smartvanio-entity-picker>
+                            </div>
+                            <div class="auto-row-action">
+                              <span class="auto-row-label-text">Action</span>
+                              <smartvanio-select
+                                .value=${row.action}
+                                .options=${this._actionsForEntity(row.target_entity_id).map((act) => ({
+                                  value: act,
+                                  label: this._actionLabel(act),
+                                }))}
+                                placeholder="— select —"
+                                ?disabled=${!row.target_entity_id}
+                                @smartvanio-change=${(e) => this._emit("smartvanio-update-edit-row", { id: i, field: "action", value: e.detail.value })}
+                              ></smartvanio-select>
+                            </div>
+                            <button
+                              class="delete-row-btn auto-row-delete"
+                              @click=${() => this._emit("smartvanio-remove-edit-row", { id: i })}
+                            >
+                              <ha-icon icon="mdi:delete-outline"></ha-icon>
+                            </button>
+                          </div>
+                        `,
+                      )}
+                    </div>
+                  ` : html`
                     <div class="modal-section">
                       <div class="modal-section-header">
                         <span class="modal-label">Automations</span>
@@ -1505,6 +1686,46 @@ class VanCtlModalEdit extends LitElement {
           color: #66bb6a;
         }
 
+        .auto-row-condition .auto-row-label-text {
+          color: var(--primary-color, #4a9eff);
+        }
+
+        .sensor-condition-row {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .sensor-condition-row smartvanio-select {
+          flex: 0 0 auto;
+          min-width: 100px;
+        }
+
+        .sensor-threshold-input {
+          flex: 1;
+          min-width: 70px;
+          max-width: 120px;
+          background: rgba(255, 255, 255, 0.06);
+          border: 1px solid rgba(255, 255, 255, 0.1);
+          border-radius: 8px;
+          color: var(--primary-text-color);
+          font-size: 14px;
+          padding: 9px 12px;
+          text-align: center;
+          -moz-appearance: textfield;
+        }
+
+        .sensor-threshold-input::-webkit-inner-spin-button,
+        .sensor-threshold-input::-webkit-outer-spin-button {
+          -webkit-appearance: none;
+          margin: 0;
+        }
+
+        .sensor-threshold-input:focus {
+          outline: none;
+          border-color: var(--primary-color, #4a9eff);
+        }
+
         .auto-duration-input {
           display: flex;
           align-items: center;
@@ -1734,23 +1955,70 @@ class VanCtlModalEdit extends LitElement {
           width: 60px;
         }
 
-        .seg-color-input {
-          width: 36px;
-          height: 36px;
-          padding: 2px;
-          border: none;
-          border-radius: 6px;
-          background: transparent;
-          cursor: pointer;
-        }
-
         .seg-name-input {
           min-width: 0;
+          flex: 1;
         }
 
-        .seg-bri-unit {
-          font-size: 0.75rem;
+        /* Segment brightness slider */
+        .seg-bri-slider-wrap {
+          flex: 1;
+          position: relative;
+          height: 36px;
+          cursor: pointer;
+          touch-action: none;
+          user-select: none;
+        }
+        .seg-bri-track {
+          position: absolute;
+          inset: 0;
+          border-radius: 16px;
+          overflow: hidden;
+          background: rgba(255,255,255,0.06);
+        }
+        .seg-bri-fill {
+          height: 100%;
+          background: var(--seg-color, var(--primary-color));
+          opacity: 0.3;
+          width: calc(12px + (100% - 24px) * var(--seg-bri, 100) / 100);
+        }
+        .seg-bri-thumb {
+          position: absolute;
+          top: 50%;
+          left: calc(12px + (100% - 24px) * var(--seg-bri, 100) / 100);
+          width: 22px;
+          height: 22px;
+          border-radius: 50%;
+          background: var(--seg-color, var(--primary-color));
+          border: 2px solid #fff;
+          box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+          transform: translate(-50%, -50%);
+          pointer-events: none;
+        }
+        .seg-bri-value {
+          font-size: 12px;
           color: var(--secondary-text-color, #888);
+          min-width: 32px;
+          text-align: right;
+          flex-shrink: 0;
+        }
+
+        /* Swatch color picker in segment list */
+        .seg-list-swatch-label {
+          position: relative;
+          display: inline-flex;
+          cursor: pointer;
+          flex-shrink: 0;
+        }
+        .seg-list-color-input {
+          position: absolute;
+          inset: 0;
+          width: 100%;
+          height: 100%;
+          opacity: 0;
+          cursor: pointer;
+          border: none;
+          padding: 0;
         }
 
         /* ── Visual strip editor ──── */
@@ -1793,6 +2061,21 @@ class VanCtlModalEdit extends LitElement {
         .strip-seg.selected {
           box-shadow: 0 0 0 2px var(--primary-color, #03a9f4);
           z-index: 2;
+        }
+        .strip-seg.drag-removing {
+          z-index: 10;
+          transition: none;
+        }
+        .strip-seg-color {
+          position: absolute;
+          inset: 0;
+          width: 100%;
+          height: 100%;
+          opacity: 0;
+          cursor: pointer;
+          border: none;
+          padding: 0;
+          pointer-events: none;
         }
 
         .strip-seg-label {
@@ -1965,157 +2248,230 @@ class VanCtlModalEdit extends LitElement {
         }
 
         /* Pattern gradient editor */
-        .pattern-editor {
-          margin: 8px 0 12px;
-        }
-        .pattern-bar-wrap {
+        /* ── Pattern editor (cssgradient.io inspired) ──── */
+        .pat-section { display: flex; flex-direction: column; gap: 12px; }
+
+        .pat-editor {
+          display: flex;
+          flex-direction: column;
           position: relative;
         }
-        .pattern-bar {
-          width: 100%;
-          height: 36px;
-          border-radius: 8px;
+
+        .pat-bar-wrap {
+          position: relative;
+          height: 48px;
+          border-radius: 10px;
+          overflow: hidden;
           border: 1px solid var(--divider-color, rgba(255,255,255,0.12));
+        }
+        .pat-bar-bg {
+          position: absolute; inset: 0;
+          background: repeating-conic-gradient(rgba(255,255,255,0.06) 0% 25%, transparent 0% 50%) 0 0 / 12px 12px;
+        }
+        .pat-bar {
+          position: absolute; inset: 0;
           cursor: crosshair;
         }
-        .pattern-stops-track {
+
+        /* Stop handle track — overlaps bottom of gradient bar */
+        .pat-handle-track {
           position: relative;
-          width: 100%;
           height: 28px;
+          margin: -6px 11px 0;
           cursor: crosshair;
+          overflow: visible;
+          z-index: 3;
         }
-        .pattern-stop {
+        .pat-handle {
           position: absolute;
           top: 0;
-          transform: translateX(-9px);
+          transform: translateX(-50%);
           cursor: grab;
           z-index: 2;
           display: flex;
           flex-direction: column;
           align-items: center;
-          width: 18px;
+          touch-action: none;
+          -webkit-tap-highlight-color: transparent;
         }
-        .stop-arrow {
-          width: 0;
-          height: 0;
-          border-left: 6px solid transparent;
-          border-right: 6px solid transparent;
-          border-bottom: 6px solid #fff;
+        .pat-handle-arrow {
+          width: 0; height: 0;
+          border-left: 7px solid transparent;
+          border-right: 7px solid transparent;
+          border-bottom: 7px solid rgba(255,255,255,0.4);
+          transition: border-bottom-color 0.15s;
         }
-        .stop-swatch {
-          width: 18px;
-          height: 18px;
-          border-radius: 3px;
-          border: 2px solid rgba(255,255,255,0.5);
-          box-shadow: 0 1px 3px rgba(0,0,0,0.5);
+        .pat-handle-color {
+          width: 22px; height: 22px;
+          border-radius: 4px;
+          border: 2.5px solid rgba(255,255,255,0.55);
+          box-shadow: 0 1px 4px rgba(0,0,0,0.5);
           box-sizing: border-box;
+          transition: border-color 0.15s, box-shadow 0.15s;
         }
-        .pattern-stop:hover .stop-swatch {
-          border-color: rgba(255,255,255,0.8);
+        .pat-handle:active { cursor: grabbing; }
+        .pat-handle:hover .pat-handle-color {
+          border-color: rgba(255,255,255,0.85);
         }
-        .pattern-stop.selected .stop-swatch {
+        .pat-handle.selected .pat-handle-color {
           border-color: var(--primary-color, #4287f5);
           box-shadow: 0 0 0 2px var(--primary-color, #4287f5), 0 1px 4px rgba(0,0,0,0.5);
         }
-        .pattern-stop.selected .stop-arrow {
+        .pat-handle.selected .pat-handle-arrow {
           border-bottom-color: var(--primary-color, #4287f5);
         }
 
-        /* Pattern stop list */
-        .pattern-stop-list {
-          display: flex;
-          flex-direction: column;
-          gap: 4px;
-          margin: 8px 0;
-        }
-        .pattern-stop-row {
+        /* Selected stop controls */
+        .pat-stop-ctrl {
           display: flex;
           align-items: center;
-          gap: 8px;
-          padding: 6px 8px;
-          border-radius: 6px;
+          gap: 10px;
+          padding: 10px 12px;
           background: var(--secondary-background-color, rgba(255,255,255,0.04));
+          border-radius: 8px;
+        }
+        .pat-color-label {
+          position: relative;
           cursor: pointer;
-          transition: background 0.15s;
-        }
-        .pattern-stop-row:hover {
-          background: rgba(255,255,255,0.08);
-        }
-        .pattern-stop-row.selected {
-          background: rgba(var(--rgb-primary-color, 66,135,245), 0.15);
-          outline: 1px solid var(--primary-color, #4287f5);
-        }
-        .pattern-stop-color {
-          width: 28px;
-          height: 28px;
-          border: none;
-          border-radius: 4px;
-          cursor: pointer;
-          padding: 0;
-          background: none;
           flex-shrink: 0;
         }
-        .pattern-stop-color::-webkit-color-swatch-wrapper { padding: 0; }
-        .pattern-stop-color::-webkit-color-swatch {
-          border: 1px solid rgba(255,255,255,0.2);
-          border-radius: 4px;
+        .pat-color-preview {
+          width: 40px; height: 40px;
+          border-radius: 8px;
+          border: 2px solid rgba(255,255,255,0.2);
+          box-sizing: border-box;
         }
-        .pattern-stop-pos {
+        .pat-color-input {
+          position: absolute; inset: 0;
+          width: 100%; height: 100%;
+          opacity: 0; cursor: pointer;
+          border: none; padding: 0;
+        }
+        .pat-field-label {
+          font-size: 10px;
+          color: var(--secondary-text-color, #888);
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+          margin-bottom: 2px;
+        }
+        .pat-hex-wrap, .pat-pos-wrap {
+          display: flex;
+          flex-direction: column;
+        }
+        .pat-hex-input {
+          width: 72px;
+          background: var(--card-background-color, #1c1c1c);
+          color: var(--primary-text-color, #fff);
+          border: 1px solid var(--divider-color, rgba(255,255,255,0.12));
+          border-radius: 6px;
+          padding: 6px 8px;
+          font-size: 13px;
+          font-family: monospace;
+        }
+        .pat-pos-input {
           width: 56px;
           background: var(--card-background-color, #1c1c1c);
           color: var(--primary-text-color, #fff);
           border: 1px solid var(--divider-color, rgba(255,255,255,0.12));
-          border-radius: 4px;
-          padding: 4px 6px;
+          border-radius: 6px;
+          padding: 6px 8px;
           font-size: 13px;
           text-align: center;
         }
-        .pattern-stop-bri {
-          flex: 1;
-          min-width: 60px;
-          height: 4px;
-          -webkit-appearance: none;
-          appearance: none;
-          background: rgba(255,255,255,0.15);
-          border-radius: 2px;
-          outline: none;
-        }
-        .pattern-stop-bri::-webkit-slider-thumb {
-          -webkit-appearance: none;
-          width: 14px;
-          height: 14px;
-          border-radius: 50%;
-          background: var(--primary-text-color, #fff);
-          cursor: pointer;
-        }
-        .pattern-stop-bri-label {
-          font-size: 11px;
-          color: var(--secondary-text-color, #999);
-          min-width: 30px;
-          text-align: right;
-        }
-        .pattern-stop-del {
-          margin-left: 0;
+        .pat-stop-del {
+          margin-left: auto;
           background: none;
           border: none;
           color: var(--secondary-text-color, #999);
           cursor: pointer;
-          padding: 2px;
-          opacity: 0.6;
+          padding: 6px;
+          opacity: 0.5;
           transition: opacity 0.15s;
         }
-        .pattern-stop-del:hover { opacity: 1; color: var(--error-color, #f44); }
-        .pattern-stop-del:disabled { opacity: 0.2; cursor: default; }
+        .pat-stop-del:hover { opacity: 1; color: var(--error-color, #f44); }
+        .pat-stop-del:disabled { opacity: 0.15; cursor: default; }
 
-        /* Pattern save row */
-        .pattern-save-row {
+        .pat-hint {
+          text-align: center;
+          color: var(--secondary-text-color, #888);
+          font-size: 13px;
+          padding: 8px 0;
+        }
+
+        /* Save row */
+        .pat-save-row {
           display: flex;
           gap: 8px;
-          margin-top: 8px;
           align-items: center;
         }
-        .pattern-name-input { flex: 1; }
-        .pattern-save-btn { flex-shrink: 0; min-width: 60px; }
+        .pat-name-input { flex: 1; }
+        .pat-save-btn { flex-shrink: 0; min-width: 60px; }
+
+        /* Saved patterns list */
+        .pat-list {
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+          border-top: 1px solid var(--divider-color, rgba(255,255,255,0.08));
+          padding-top: 8px;
+        }
+        .pat-list-item {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          padding: 8px 10px;
+          border-radius: 8px;
+          cursor: pointer;
+          transition: background 0.15s;
+        }
+        .pat-list-item:hover { background: rgba(255,255,255,0.05); }
+        .pat-list-item.active {
+          background: rgba(var(--rgb-primary-color, 66,135,245), 0.15);
+          outline: 1px solid rgba(var(--rgb-primary-color, 66,135,245), 0.5);
+        }
+        .pat-list-grad {
+          width: 48px; height: 24px;
+          border-radius: 4px;
+          flex-shrink: 0;
+          border: 1px solid rgba(255,255,255,0.1);
+        }
+        .pat-list-name {
+          flex: 1;
+          font-size: 13px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .pat-list-del {
+          background: none;
+          border: none;
+          color: var(--secondary-text-color, #888);
+          cursor: pointer;
+          padding: 2px;
+          opacity: 0.5;
+          transition: opacity 0.15s;
+        }
+        .pat-list-del:hover { opacity: 1; color: var(--error-color, #f44); }
+
+        .pat-add-btn {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 6px;
+          width: 100%;
+          padding: 10px;
+          border: 1px dashed var(--divider-color, rgba(255,255,255,0.15));
+          border-radius: 8px;
+          background: none;
+          color: var(--secondary-text-color, #888);
+          font-size: 13px;
+          cursor: pointer;
+          transition: color 0.15s, border-color 0.15s;
+        }
+        .pat-add-btn:hover {
+          color: var(--primary-text-color, #fff);
+          border-color: var(--primary-color, #4287f5);
+        }
 
         .seg-max-wrap {
           display: flex;
@@ -2446,15 +2802,13 @@ class VanCtlModalEdit extends LitElement {
             padding: 10px 10px;
             font-size: 14px;
           }
-          .pattern-stop-pos {
+          .pat-bar-wrap { height: 56px; }
+          .pat-handle-color { width: 26px; height: 26px; }
+          .pat-hex-input, .pat-pos-input {
             font-size: 16px;
             padding: 8px 10px;
-            width: 64px;
           }
-          .pattern-stop-color {
-            width: 36px;
-            height: 36px;
-          }
+          .pat-color-preview { width: 44px; height: 44px; }
           .right-tab {
             font-size: 14px;
             padding: 12px;
