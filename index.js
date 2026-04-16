@@ -538,14 +538,14 @@ const Ta=(t,e)=>{const i=t._$AN;if(void 0===i)return!1;for(const t of i)t._$AO?.
           <div class="ctrl-bri-thumb" style="${h?"background:none; border-color:rgba(255,255,255,0.8)":""}"></div>
         </div>
 
-        ${o?(()=>{const e=this._localRgb||n,i=this._rgbToWheelPos(e,200);return j`
+        ${o?(()=>{const t=this._localRgb||n,e=this._rgbToWheelPos(t,200);return j`
           <div class="ctrl-wheel-wrap">
             <canvas class="ctrl-color-wheel" width="200" height="200"
               ${Oa(t=>{t&&this._onWheelRef(t)})}
               @pointerdown=${t=>this._ctrlColorPick(t,!0)}
               @pointermove=${t=>this._ctrlColorPick(t,!1)}
               @pointerup=${t=>this._ctrlColorRelease(t)}></canvas>
-            ${i?j`<div class="ctrl-wheel-indicator" style="left:${i.x}px;top:${i.y}px;background:rgb(${e.join(",")})"></div>`:""}
+            ${e?j`<div class="ctrl-wheel-indicator" style="left:${e.x}px;top:${e.y}px;background:rgb(${t.join(",")})"></div>`:""}
           </div>
           <div class="ctrl-presets">
             ${this._presetColors.map(([t,e,i])=>j`
@@ -553,19 +553,19 @@ const Ta=(t,e)=>{const i=t._$AN;if(void 0===i)return!1;for(const t of i)t._$AO?.
                 @click=${()=>this._emit("smartvanio-light-color",{rgb:[t,e,i]})}></span>
             `)}
           </div>
-          ${d.length?j`
-            <div class="ctrl-patterns">
-              ${d.map(e=>j`
-                <div class="ctrl-pattern-chip ${this.activePattern===`${t}:${e}`?"active":""}"
-                  title="${e}"
-                  @click=${()=>this._emit("smartvanio-light-pattern",{name:e,stops:l[e]})}>
-                  <div class="ctrl-pattern-gradient" style="background:${this._patternGradientCSS(l[e])}"></div>
-                  <span class="ctrl-pattern-name">${e}</span>
-                </div>
-              `)}
-            </div>
-          `:""}
           `})():""}
+        ${d.length?j`
+          <div class="ctrl-patterns">
+            ${d.map(e=>j`
+              <div class="ctrl-pattern-chip ${this.activePattern===`${t}:${e}`?"active":""}"
+                title="${e}"
+                @click=${()=>this._emit("smartvanio-light-pattern",{name:e,stops:l[e]})}>
+                <div class="ctrl-pattern-gradient" style="background:${this._patternGradientCSS(l[e])}"></div>
+                <span class="ctrl-pattern-name">${e}</span>
+              </div>
+            `)}
+          </div>
+        `:""}
       </div>
     `}_renderAreaPicker(){const t=Object.values(this.hass?.areas??{}).sort((t,e)=>t.name.localeCompare(e.name)),e=this.editArea||"",i=this._areaPickerOpen,s=(this._areaFilter??"").toLowerCase(),r=s?t.filter(t=>t.name.toLowerCase().includes(s)):t;return j`
       <div class="area-picker">

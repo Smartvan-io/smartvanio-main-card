@@ -285,20 +285,20 @@ class VanCtlModalEdit extends LitElement {
                 @click=${() => this._emit('smartvanio-light-color', { rgb: [r, g, b] })}></span>
             `)}
           </div>
-          ${patternNames.length ? html`
-            <div class="ctrl-patterns">
-              ${patternNames.map(name => html`
-                <div class="ctrl-pattern-chip ${this.activePattern === `${eid}:${name}` ? 'active' : ''}"
-                  title="${name}"
-                  @click=${() => this._emit('smartvanio-light-pattern', { name, stops: patterns[name] })}>
-                  <div class="ctrl-pattern-gradient" style="background:${this._patternGradientCSS(patterns[name])}"></div>
-                  <span class="ctrl-pattern-name">${name}</span>
-                </div>
-              `)}
-            </div>
-          ` : ''}
           `;
         })() : ''}
+        ${patternNames.length ? html`
+          <div class="ctrl-patterns">
+            ${patternNames.map(name => html`
+              <div class="ctrl-pattern-chip ${this.activePattern === `${eid}:${name}` ? 'active' : ''}"
+                title="${name}"
+                @click=${() => this._emit('smartvanio-light-pattern', { name, stops: patterns[name] })}>
+                <div class="ctrl-pattern-gradient" style="background:${this._patternGradientCSS(patterns[name])}"></div>
+                <span class="ctrl-pattern-name">${name}</span>
+              </div>
+            `)}
+          </div>
+        ` : ''}
       </div>
     `;
   }
