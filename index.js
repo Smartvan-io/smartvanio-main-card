@@ -5569,7 +5569,7 @@ const Ta=(t,e)=>{const i=t._$AN;if(void 0===i)return!1;for(const t of i)t._$AO?.
               </div>
             `:""}
       </div>
-    `:j``}_lightIcon(t){const e=this.hass?.states[t];return e?.attributes?.smartvanio_parent_entity_id?"mdi:led-strip":/strip/i.test(t)?"mdi:led-strip-variant":/spot/i.test(t)?"mdi:spotlight-beam":/main/i.test(t)?"mdi:lightbulb":"mdi:lightbulb-outline"}_onTilePointerDown(t,e){this._setupMode||0!==t.button&&"touch"!==t.pointerType||(this._tileLpOrigin={x:t.clientX,y:t.clientY},this._tileLpTimer=setTimeout(()=>{this._tileLpTimer=null,this._tileLpOrigin=null;const i=t.currentTarget.getBoundingClientRect();this._tilePopover={eid:e,x:i.left+i.width/2,y:i.top}},400))}_onTilePointerMove(t){if(this._setupMode)return;if(!this._tileLpTimer||!this._tileLpOrigin)return;const e=t.clientX-this._tileLpOrigin.x,i=t.clientY-this._tileLpOrigin.y;Math.sqrt(e*e+i*i)>8&&(clearTimeout(this._tileLpTimer),this._tileLpTimer=null,this._tileLpOrigin=null)}_onTilePointerUp(t,e){this._setupMode?this._openEditModal(e):this._tileLpTimer&&(clearTimeout(this._tileLpTimer),this._tileLpTimer=null,this._tileLpOrigin=null,this._toggleLight(e))}_renderTilePopover(){const t=this._tilePopover;if(!t)return j``;const e=t.eid,i=this.hass.states[e],s="on"===i?.state,r=this._bri(e),a=Math.round(r/255*100),n=i?.attributes?.rgb_color??[255,200,80],[o,l,d]=n,c=(i?.attributes?.supported_color_modes??[]).some(t=>["rgb","rgbw","rgbww","hs","xy"].includes(t)),p="#"+n.map(t=>t.toString(16).padStart(2,"0")).join(""),h=s?`rgb(${o},${l},${d})`:"var(--sv-text-disabled)",u=`linear-gradient(to right, ${h} 0%, ${h} ${a}%, rgba(255,255,255,0.08) ${a}%, rgba(255,255,255,0.08) 100%)`;return j`
+    `:j``}_lightIcon(t){const e=this.hass?.states[t];return e?.attributes?.smartvanio_parent_entity_id?"mdi:led-strip":/strip/i.test(t)?"mdi:led-strip-variant":/spot/i.test(t)?"mdi:spotlight-beam":/main/i.test(t)?"mdi:lightbulb":"mdi:lightbulb-outline"}_onTilePointerDown(t,e){this._setupMode||0!==t.button&&"touch"!==t.pointerType||(this._tileLpOrigin={x:t.clientX,y:t.clientY},this._tileLpTimer=setTimeout(()=>{this._tileLpTimer=null,this._tileLpOrigin=null;const i=t.currentTarget.getBoundingClientRect();this._tilePopover={eid:e,x:i.left+i.width/2,y:i.top}},400))}_onTilePointerMove(t){if(this._setupMode)return;if(!this._tileLpTimer||!this._tileLpOrigin)return;const e=t.clientX-this._tileLpOrigin.x,i=t.clientY-this._tileLpOrigin.y;Math.sqrt(e*e+i*i)>8&&(clearTimeout(this._tileLpTimer),this._tileLpTimer=null,this._tileLpOrigin=null)}_onTilePointerUp(t,e){this._setupMode?this._openEditModal(e):this._tileLpTimer&&(clearTimeout(this._tileLpTimer),this._tileLpTimer=null,this._tileLpOrigin=null,this._toggleLight(e))}_renderTilePopover(){const t=this._tilePopover;if(!t)return j``;const e=t.eid,i=this.hass.states[e],s="on"===i?.state,r=this._bri(e),a=Math.round(r/255*100),n=i?.attributes?.rgb_color??[255,200,80],[o,l,d]=n,c=(i?.attributes?.supported_color_modes??[]).some(t=>["rgb","rgbw","rgbww","hs","xy"].includes(t)),p="#"+n.map(t=>t.toString(16).padStart(2,"0")).join(""),h=s?`rgb(${o},${l},${d})`:"var(--sv-text-disabled)",u=`linear-gradient(to right, ${h} 0%, ${h} ${a}%, rgba(255,255,255,0.08) ${a}%, rgba(255,255,255,0.08) 100%)`,g=this._getEntityPatterns(e),m=Object.keys(g),v=this._getActivePatternName(e);return j`
       <div class="popover-overlay" @click=${()=>{this._tilePopover=null}}>
         <div
           class="popover"
@@ -5606,6 +5606,17 @@ const Ta=(t,e)=>{const i=t._$AN;if(void 0===i)return!1;for(const t of i)t._$AO?.
                 />
                 <div class="popover-swatch" style="background:${p}"
                   @click=${t=>t.target.previousElementSibling.click()}></div>
+              </div>
+            `:""}
+            ${m.length?j`
+              <div class="popover-patterns">
+                ${m.map(t=>j`
+                  <div class="popover-pat-chip ${v===t?"active":""}"
+                    @click=${()=>{this._applyPattern(e,t,g[t]),this._tilePopover=null}}>
+                    <div class="popover-pat-grad" style="background:${this._patternGradientCSS(g[t])}"></div>
+                    <span class="popover-pat-name">${t}</span>
+                  </div>
+                `)}
               </div>
             `:""}
           </div>
@@ -5758,7 +5769,7 @@ const Ta=(t,e)=>{const i=t._$AN;if(void 0===i)return!1;for(const t of i)t._$AO?.
       <div class="hmi">
         <!-- Top bar -->
         <div class="top-bar">
-          <span class="tb-greeting">${o} <span style="font-size:10px;opacity:0.4;font-weight:400">v140</span></span>
+          <span class="tb-greeting">${o} <span style="font-size:10px;opacity:0.4;font-weight:400">v141</span></span>
           <div class="tb-stats">
             ${l.length?l.map(({entity:t,name:e,icon:i},s)=>{const r=this.hass.states[t];if(!r)return"";const a=r.state,n=r.attributes?.unit_of_measurement??"",o=i&&i.length>0?i:r.attributes?.icon||"mdi:eye",l="unavailable"===a?"—":(parseFloat(a)==parseFloat(a)?Number.isInteger(parseFloat(a))?a:parseFloat(a).toFixed(1):a)+(n?" "+n:"");return j`
                 ${s>0?j`<span class="tb-divider"></span>`:""}
@@ -8918,6 +8929,44 @@ const Ta=(t,e)=>{const i=t._$AN;if(void 0===i)return!1;for(const t of i)t._$AO?.
       .popover-swatch:hover {
         border-color: rgba(255,255,255,0.4);
       }
+
+      .popover-patterns {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        padding-top: 4px;
+      }
+      .popover-pat-chip {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 3px;
+        cursor: pointer;
+        border: 2px solid transparent;
+        border-radius: 8px;
+        padding: 3px;
+        transition: border-color 0.15s, transform 0.15s;
+        flex: 1;
+        min-width: 48px;
+      }
+      .popover-pat-chip:hover { transform: scale(1.05); border-color: rgba(255,255,255,0.3); }
+      .popover-pat-chip.active { border-color: var(--primary-color, #4a9eff); box-shadow: 0 0 6px rgba(74,158,255,0.4); }
+      .popover-pat-grad {
+        width: 100%;
+        height: 18px;
+        border-radius: 5px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+      }
+      .popover-pat-name {
+        font-size: 10px;
+        color: var(--secondary-text-color, rgba(255,255,255,0.6));
+        text-align: center;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 100%;
+      }
+      .popover-pat-chip.active .popover-pat-name { color: var(--primary-color, #4a9eff); }
 
       /* (switches-panel removed — switches now in unified grid) */
 

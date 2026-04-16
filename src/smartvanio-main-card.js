@@ -6017,6 +6017,10 @@ class VanCtlHmiCard extends LitElement {
     const sliderColor = isOn ? `rgb(${r},${g},${b})` : 'var(--sv-text-disabled)';
     const sliderBg = `linear-gradient(to right, ${sliderColor} 0%, ${sliderColor} ${briPct}%, rgba(255,255,255,0.08) ${briPct}%, rgba(255,255,255,0.08) 100%)`;
 
+    const patterns = this._getEntityPatterns(eid);
+    const patternNames = Object.keys(patterns);
+    const activePatName = this._getActivePatternName(eid);
+
     return html`
       <div class="popover-overlay" @click=${() => { this._tilePopover = null; }}>
         <div
@@ -6071,6 +6075,20 @@ class VanCtlHmiCard extends LitElement {
                 />
                 <div class="popover-swatch" style="background:${hexColor}"
                   @click=${(e) => e.target.previousElementSibling.click()}></div>
+              </div>
+            ` : ''}
+            ${patternNames.length ? html`
+              <div class="popover-patterns">
+                ${patternNames.map(name => html`
+                  <div class="popover-pat-chip ${activePatName === name ? 'active' : ''}"
+                    @click=${() => {
+                      this._applyPattern(eid, name, patterns[name]);
+                      this._tilePopover = null;
+                    }}>
+                    <div class="popover-pat-grad" style="background:${this._patternGradientCSS(patterns[name])}"></div>
+                    <span class="popover-pat-name">${name}</span>
+                  </div>
+                `)}
               </div>
             ` : ''}
           </div>
@@ -6523,7 +6541,7 @@ class VanCtlHmiCard extends LitElement {
       <div class="hmi">
         <!-- Top bar -->
         <div class="top-bar">
-          <span class="tb-greeting">${greeting} <span style="font-size:10px;opacity:0.4;font-weight:400">v140</span></span>
+          <span class="tb-greeting">${greeting} <span style="font-size:10px;opacity:0.4;font-weight:400">v141</span></span>
           <div class="tb-stats">
             ${topbarStats.length ? topbarStats.map(({entity, name, icon}, i) => {
               const st = this.hass.states[entity];
@@ -9836,6 +9854,44 @@ class VanCtlHmiCard extends LitElement {
       .popover-swatch:hover {
         border-color: rgba(255,255,255,0.4);
       }
+
+      .popover-patterns {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        padding-top: 4px;
+      }
+      .popover-pat-chip {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 3px;
+        cursor: pointer;
+        border: 2px solid transparent;
+        border-radius: 8px;
+        padding: 3px;
+        transition: border-color 0.15s, transform 0.15s;
+        flex: 1;
+        min-width: 48px;
+      }
+      .popover-pat-chip:hover { transform: scale(1.05); border-color: rgba(255,255,255,0.3); }
+      .popover-pat-chip.active { border-color: var(--primary-color, #4a9eff); box-shadow: 0 0 6px rgba(74,158,255,0.4); }
+      .popover-pat-grad {
+        width: 100%;
+        height: 18px;
+        border-radius: 5px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+      }
+      .popover-pat-name {
+        font-size: 10px;
+        color: var(--secondary-text-color, rgba(255,255,255,0.6));
+        text-align: center;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 100%;
+      }
+      .popover-pat-chip.active .popover-pat-name { color: var(--primary-color, #4a9eff); }
 
       /* (switches-panel removed — switches now in unified grid) */
 
