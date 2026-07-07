@@ -247,7 +247,7 @@ class VanCtlModalScene extends LitElement {
           border-radius: 16px;
           width: 100%;
           max-width: 480px;
-          max-height: 90vh;
+          max-height: 90dvh;
           display: flex;
           flex-direction: column;
           box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
@@ -289,6 +289,7 @@ class VanCtlModalScene extends LitElement {
           padding: 18px;
           overflow-y: auto;
           flex: 1;
+          min-height: 0;
           display: flex;
           flex-direction: column;
           gap: 20px;

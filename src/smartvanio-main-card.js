@@ -117,6 +117,7 @@ class VanCtlHmiCard extends LitElement {
       _lightSegments:   { type: Array },
       _lightPatterns:   { type: Object },
       _maxLeds:         { type: Number },
+      _switchMode:      { type: Object },
       _footerModal:     { type: Object },  // { key, idx, item, type } or null
       _footerAddMenu:   { type: Boolean },
       _lightModal:      { type: Object },  // { item, isNew } or null — add/edit light modal
@@ -126,12 +127,21 @@ class VanCtlHmiCard extends LitElement {
       _page:            { type: String },   // 'dashboard' | 'devices'
       _deviceModal:     { type: Object },   // { device, deviceId, entities, inCardEids } or null
       _theme:           { type: String },
+      _showRightPanel:  { type: Boolean },
+      _navDrawerOpen:   { type: Boolean },
     };
   }
 
   constructor() {
     super();
     this._theme = localStorage.getItem('smartvanio-theme') || 'dark';
+    // Right-panel (climate/level/overview) is collapsed by default — lights are the
+    // primary surface, so give them full width and let the user summon climate on demand.
+    this._showRightPanel = localStorage.getItem('smartvanio-show-right-panel') === '1';
+    this._navDrawerOpen = false;
+    this._onNavKeydown = (e) => {
+      if (e.key === 'Escape' && this._navDrawerOpen) this._closeNavDrawer();
+    };
     this._selectedId = null;
     this._dragState = new Map();
     this._pendingTargetTemp = null;
@@ -196,6 +206,7 @@ class VanCtlHmiCard extends LitElement {
 
   connectedCallback() {
     super.connectedCallback();
+    document.addEventListener('keydown', this._onNavKeydown);
     // Set card height = viewport bottom minus our top edge.
     // This works regardless of whether the parent has an explicit height.
     const setH = () => {
@@ -261,6 +272,7 @@ class VanCtlHmiCard extends LitElement {
 
   disconnectedCallback() {
     super.disconnectedCallback();
+    document.removeEventListener('keydown', this._onNavKeydown);
     this._destroySwiper();
     this._cleanupNebulaBg();
     this._ro?.disconnect();
@@ -2891,6 +2903,27 @@ class VanCtlHmiCard extends LitElement {
     this._editOriginalIds = {};
     this._lightSegments = [];
     this._maxLeds = 0;
+    // For relays, find the firmware-provided NO/NC mode select entity so the
+    // edit modal can expose it as a dropdown (firmware owns the invert logic).
+    this._switchMode = null;
+    if (entity_id.startsWith("switch.")) {
+      const info = this._resolveEntityTopic(entity_id);
+      if (info?.deviceId && info?.channel) {
+        const wantUnique = `${info.deviceId}_${info.channel}_mode`;
+        const selEid = Object.keys(this.hass.entities ?? {}).find(
+          (eid) => eid.startsWith("select.") &&
+                   this.hass.entities[eid]?.unique_id === wantUnique,
+        );
+        if (selEid) {
+          const st = this.hass.states[selEid];
+          this._switchMode = {
+            entityId: selEid,
+            options: st?.attributes?.options ?? ["Normally Open", "Normally Closed"],
+            current: st?.state ?? "Normally Open",
+          };
+        }
+      }
+    }
     this._editLoading = true;
     this._editSaving = false;
     this._saveError = null;
@@ -3021,6 +3054,17 @@ class VanCtlHmiCard extends LitElement {
     } finally {
       this._editLoading = false;
     }
+  }
+
+  // Apply a NO/NC relay mode change immediately by setting the firmware's
+  // companion select entity (firmware owns the actual invert logic).
+  _setSwitchMode(value) {
+    if (!this._switchMode?.entityId) return;
+    this._switchMode = { ...this._switchMode, current: value };
+    this.hass.callService("select", "select_option", {
+      entity_id: this._switchMode.entityId,
+      option: value,
+    });
   }
 
   async _saveEdit({ entity_id, name, area, rows, lightSegments, maxLeds }) {
@@ -3557,23 +3601,14 @@ class VanCtlHmiCard extends LitElement {
 
             const editEid = isSegment ? (state?.attributes?.smartvanio_parent_entity_id ?? eid) : eid;
 
-            const liveBri = (this._lpBriLocal?.eid === eid) ? this._lpBriLocal.pct : bri;
-            // Check for active pattern (optimistic or from HA state)
-            let tilePatternGrad = null;
-            let patternStops = null;
+            // Icon colour reflects active pattern (first stop) when one is running.
             const activePatName = this._getActivePatternName(eid);
-            if (activePatName) {
-              const pats = this._getEntityPatterns(eid);
-              patternStops = pats[activePatName];
-              if (patternStops) tilePatternGrad = this._patternGradientCSS(patternStops);
-            }
+            const patternStops = activePatName ? (this._getEntityPatterns(eid)?.[activePatName] ?? null) : null;
             const patFirstColor = patternStops?.length ? `rgb(${patternStops[0].r},${patternStops[0].g},${patternStops[0].b})` : null;
-            const sliderColor = patFirstColor || (curRgb ? `rgb(${curRgb.join(',')})` : 'var(--sv-accent)');
             const iconColor = unavail ? 'var(--sv-red)' : isOn && patFirstColor ? patFirstColor : isOn && curRgb ? `rgb(${curRgb.join(',')})` : isOn ? 'var(--sv-accent)' : 'var(--sv-text-secondary)';
             return html`
               <div class="lp-row ${isOn ? 'on' : ''} ${unavail ? 'unavail' : ''}"
-                   @pointerdown=${(e) => {
-                     if (e.target.closest('.lp-slider-wrap')) return;
+                   @pointerdown=${() => {
                      this._lightLpFired = false;
                      this._lightLpTimer = setTimeout(() => {
                        this._lightLpTimer = null;
@@ -3582,28 +3617,20 @@ class VanCtlHmiCard extends LitElement {
                      }, 500);
                    }}
                    @pointerup=${() => { if (this._lightLpTimer) { clearTimeout(this._lightLpTimer); this._lightLpTimer = null; } }}
-                   @pointerleave=${() => { if (this._lightLpTimer) { clearTimeout(this._lightLpTimer); this._lightLpTimer = null; } }}>
+                   @pointerleave=${() => { if (this._lightLpTimer) { clearTimeout(this._lightLpTimer); this._lightLpTimer = null; } }}
+                   @pointercancel=${() => { if (this._lightLpTimer) { clearTimeout(this._lightLpTimer); this._lightLpTimer = null; } this._lightLpFired = false; }}>
                 <div class="lp-header" @click=${() => { if (this._lightLpFired) { this._lightLpFired = false; return; } if (!unavail) this._toggleLight(eid); }}>
                   <ha-icon class="lp-icon" icon="${icon}"
-                    style="--mdc-icon-size:20px; opacity:${unavail ? 0.25 : isOn ? 1 : 0.55}; color:${iconColor}"></ha-icon>
+                    style="--mdc-icon-size:30px; opacity:${unavail ? 0.25 : isOn ? 1 : 0.55}; color:${iconColor}"></ha-icon>
                   <div class="lp-info">
                     <span class="lp-name"><span class="lp-name-text">${name}</span>${typeLabel ? html`<span class="lp-type">${typeLabel}</span>` : ''}</span>
-                    <span class="lp-bri">${unavail ? 'Unavailable' : isOn ? liveBri + '%' : 'Off'}</span>
+                    <span class="lp-bri">${unavail ? 'Unavailable' : isOn ? bri + '%' : 'Off'}</span>
                   </div>
                   <button class="lp-power" @click=${(e) => { e.stopPropagation(); if (!unavail) this._toggleLight(eid); }}
                     style="color:${isOn ? 'var(--sv-accent)' : 'var(--sv-text-disabled)'}">
-                    <ha-icon icon="mdi:power" style="--mdc-icon-size:18px"></ha-icon>
+                    <ha-icon icon="mdi:power" style="--mdc-icon-size:26px"></ha-icon>
                   </button>
                 </div>
-                ${!unavail ? html`
-                  <div class="lp-slider-wrap" style="--lp-bri:${liveBri}; --lp-color:${sliderColor}"
-                    @pointerdown=${(e) => this._lpBriPick(e, eid, true)}
-                    @pointermove=${(e) => this._lpBriPick(e, eid, false)}
-                    @pointerup=${(e) => this._lpBriRelease(e, eid)}>
-                    <div class="lp-slider-track"><div class="lp-slider-fill" style="${tilePatternGrad ? `background:${tilePatternGrad}; width:100%; opacity:0.35` : ''}"></div></div>
-                    <div class="lp-slider-thumb" style="${tilePatternGrad ? `background:none; border-color:rgba(255,255,255,0.8)` : ''}"></div>
-                  </div>
-                ` : ''}
               </div>
             `;
           })}
@@ -3681,34 +3708,6 @@ class VanCtlHmiCard extends LitElement {
     this.hass.callService('light', 'turn_on', { entity_id: eid, effect: name });
     if (!this._activePatterns) this._activePatterns = new Map();
     this._activePatterns.set(eid, name);
-  }
-
-  _lpBriPick(e, eid, capture) {
-    if (capture) {
-      e.target.setPointerCapture(e.pointerId);
-      e.stopPropagation();
-    }
-    if (!e.buttons && !capture) return;
-    e.stopPropagation();
-    const rect = e.currentTarget.getBoundingClientRect();
-    const pad = 16;
-    const x = Math.max(pad, Math.min(e.clientX - rect.left, rect.width - pad));
-    const pct = Math.round(((x - pad) / (rect.width - pad * 2)) * 100);
-    this._lpBriLocal = { eid, pct };
-    this.requestUpdate();
-    const now = Date.now();
-    if (!this._lastLpBriEmit || now - this._lastLpBriEmit > 80) {
-      this._lastLpBriEmit = now;
-      this.hass.callService('light', 'turn_on', { entity_id: eid, brightness_pct: pct });
-    }
-  }
-
-  _lpBriRelease(e, eid) {
-    e.target.releasePointerCapture(e.pointerId);
-    if (this._lpBriLocal?.eid === eid) {
-      this.hass.callService('light', 'turn_on', { entity_id: eid, brightness_pct: this._lpBriLocal.pct });
-    }
-    setTimeout(() => { this._lpBriLocal = null; this.requestUpdate(); }, 500);
   }
 
   _clearPattern(eid) {
@@ -4752,6 +4751,20 @@ class VanCtlHmiCard extends LitElement {
     this._theme = this._theme === 'dark' ? 'light' : 'dark';
     localStorage.setItem('smartvanio-theme', this._theme);
   }
+
+  _toggleRightPanel() {
+    this._showRightPanel = !this._showRightPanel;
+    localStorage.setItem('smartvanio-show-right-panel', this._showRightPanel ? '1' : '0');
+    // Swiper needs to re-initialise once the panel is in the DOM
+    if (this._showRightPanel) {
+      this.updateComplete.then(() => this._initSwiper());
+    } else {
+      this._destroySwiper();
+    }
+  }
+
+  _openNavDrawer()  { this._navDrawerOpen = true; }
+  _closeNavDrawer() { this._navDrawerOpen = false; }
 
   _toggleHaSidebar() {
     const url = new URL(window.location.href);
@@ -6097,6 +6110,72 @@ class VanCtlHmiCard extends LitElement {
     `;
   }
 
+  // ── Nav drawer (slide-out menu) ────────────────────────────────
+
+  _renderNavDrawer() {
+    const isDark = this._theme === 'dark';
+    return html`
+      <div class="nd-overlay" @click=${(e) => { if (e.target === e.currentTarget) this._closeNavDrawer(); }}>
+        <div class="nd-panel" @click=${(e) => e.stopPropagation()}>
+          <div class="nd-header">
+            <span class="nd-title">Menu</span>
+            <button class="nd-close" @click=${() => this._closeNavDrawer()} aria-label="Close menu">
+              <ha-icon icon="mdi:close" style="--mdc-icon-size:22px"></ha-icon>
+            </button>
+          </div>
+          <div class="nd-body">
+            <div class="nd-section-label">View</div>
+            <button class="nd-row" @click=${() => { this._toggleTheme(); this._closeNavDrawer(); }}>
+              <ha-icon class="nd-row-icon" icon="${isDark ? 'mdi:weather-night' : 'mdi:weather-sunny'}" style="--mdc-icon-size:22px"></ha-icon>
+              <span class="nd-row-label">Theme</span>
+              <span class="nd-row-state on">${isDark ? 'Dark' : 'Light'}</span>
+            </button>
+
+            <div class="nd-section-label">Navigate</div>
+            <button class="nd-row" @click=${() => { this._page = 'devices'; this._closeNavDrawer(); }}>
+              <ha-icon class="nd-row-icon" icon="mdi:chip" style="--mdc-icon-size:22px"></ha-icon>
+              <span class="nd-row-label">Devices</span>
+              <ha-icon class="nd-row-chevron" icon="mdi:chevron-right"></ha-icon>
+            </button>
+
+            <div class="nd-section-label">Edit</div>
+            <button class="nd-row" @click=${() => { this._enterLayoutMode(); this._closeNavDrawer(); }}>
+              <ha-icon class="nd-row-icon" icon="mdi:sort" style="--mdc-icon-size:22px"></ha-icon>
+              <span class="nd-row-label">Reorder &amp; hide</span>
+              <ha-icon class="nd-row-chevron" icon="mdi:chevron-right"></ha-icon>
+            </button>
+            <button class="nd-row" @click=${() => { this._enterSetupMode(); this._closeNavDrawer(); }}>
+              <ha-icon class="nd-row-icon" icon="mdi:cog" style="--mdc-icon-size:22px"></ha-icon>
+              <span class="nd-row-label">Settings</span>
+              <ha-icon class="nd-row-chevron" icon="mdi:chevron-right"></ha-icon>
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // ── Climate panel edge tab ─────────────────────────────────────
+
+  _renderClimateTab() {
+    // Hide on non-dashboard pages and while in setup/layout modes
+    if (this._page !== 'dashboard') return '';
+    if (this._setupMode || this._layoutMode) return '';
+
+    const open = !!this._showRightPanel;
+    return html`
+      <button class="ct-tab ${open ? 'open' : ''}"
+              @click=${() => this._toggleRightPanel()}
+              aria-label="${open ? 'Hide climate panel' : 'Show climate panel'}"
+              title="${open ? 'Hide climate panel' : 'Show climate panel'}">
+        <ha-icon class="ct-tab-chev"
+                 icon="${open ? 'mdi:chevron-right' : 'mdi:chevron-left'}"
+                 style="--mdc-icon-size:22px"></ha-icon>
+        <span class="ct-tab-label">Climate</span>
+      </button>
+    `;
+  }
+
   _renderLightTile({ eid, state, _slotName = null }) {
     const isOn = state?.state === 'on';
     const isOffline = !state || state.state === 'unavailable';
@@ -6541,7 +6620,7 @@ class VanCtlHmiCard extends LitElement {
       <div class="hmi">
         <!-- Top bar -->
         <div class="top-bar">
-          <span class="tb-greeting">${greeting} <span style="font-size:10px;opacity:0.4;font-weight:400">v141</span></span>
+          <span class="tb-greeting">${greeting} <span style="font-size:10px;opacity:0.4;font-weight:400">v159</span></span>
           <div class="tb-stats">
             ${topbarStats.length ? topbarStats.map(({entity, name, icon}, i) => {
               const st = this.hass.states[entity];
@@ -6597,17 +6676,9 @@ class VanCtlHmiCard extends LitElement {
               <button class="setup-cancel-btn" @click=${() => this._cancelLayoutMode()}>Cancel</button>
               <button class="setup-save-btn" @click=${() => this._saveLayoutMode()}>Save</button>
             ` : !this._setupMode ? html`
-              <span class="tb-cfg" @click=${() => this._toggleTheme()} title="Toggle theme">
-                <ha-icon icon="${this._theme === 'dark' ? 'mdi:weather-sunny' : 'mdi:weather-night'}" style="--mdc-icon-size:16px"></ha-icon>
-              </span>
-              <span class="tb-cfg ${this._page === 'devices' ? 'active' : ''}" @click=${() => { this._page = this._page === 'devices' ? 'dashboard' : 'devices'; }} title="Devices">
-                <ha-icon icon="mdi:chip" style="--mdc-icon-size:16px"></ha-icon>
-              </span>
-              <span class="tb-cfg" @click=${() => this._enterLayoutMode()} title="Reorder & hide">
-                <ha-icon icon="mdi:sort" style="--mdc-icon-size:16px"></ha-icon>
-              </span>
-              <span class="tb-cfg" @click=${() => this._enterSetupMode()} title="Settings">
-                <ha-icon icon="mdi:cog" style="--mdc-icon-size:16px"></ha-icon>
+              <span class="tb-cfg ${this._navDrawerOpen ? 'active' : ''}"
+                    @click=${() => this._openNavDrawer()} title="Menu">
+                <ha-icon icon="mdi:menu" style="--mdc-icon-size:24px"></ha-icon>
               </span>
             ` : html`
               <button class="setup-cancel-btn" @click=${() => this._cancelSetupMode()}>Cancel</button>
@@ -6621,13 +6692,13 @@ class VanCtlHmiCard extends LitElement {
           <!-- Scene carousel -->
           ${this._renderSceneCarousel()}
 
-          <!-- Two-column control area -->
-          <div class="control-area">
+          <!-- Two-column control area (right panel collapsible) -->
+          <div class="control-area ${this._showRightPanel ? '' : 'solo-left'}">
             <!-- Left: lights list -->
             ${this._renderLightsPanel(lights)}
 
             <!-- Right: climate / level swipeable -->
-            ${this._renderRightPanel(safeEntities, slots, level)}
+            ${this._showRightPanel ? this._renderRightPanel(safeEntities, slots, level) : ''}
           </div>
         </div>
 
@@ -6637,6 +6708,8 @@ class VanCtlHmiCard extends LitElement {
 
         ${this._renderAutoModal()}
         ${this._renderTilePopover()}
+        ${this._navDrawerOpen ? this._renderNavDrawer() : ''}
+        ${this._renderClimateTab()}
         ${this._footerModal ? this._renderFooterModal() : ''}
         ${this._lightModal ? this._renderLightModal() : ''}
         ${this._editingScene ? html`
@@ -6674,6 +6747,7 @@ class VanCtlHmiCard extends LitElement {
                 ?edit-loading=${this._editLoading}
                 ?is-button=${this._editingEntity.startsWith("button.") || this._editingEntity.startsWith("binary_sensor.")}
                 ?is-switch=${this._editingEntity.startsWith("switch.")}
+                .switchMode=${this._switchMode}
                 ?is-light=${this._editingEntity.startsWith("light.") && this._isSmartvanioLight(this._editingEntity)}
                 ?is-tank=${this._editingEntity.startsWith("sensor.") && (this.hass.states[this._editingEntity]?.attributes?.device_class === "volume" || this._editingEntity.includes("tank"))}
                 ?is-sensor=${this._editingEntity.startsWith("sensor.")}
@@ -6966,11 +7040,11 @@ class VanCtlHmiCard extends LitElement {
       /* ── Top bar ────────────────────────────────────────── */
 
       .top-bar {
-        height: 48px;
+        height: 56px;
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 0 24px;
+        padding: 0 16px 0 24px;
         background: var(--sv-bg-rail);
         border-bottom: 1px solid var(--sv-border);
         flex-shrink: 0;
@@ -7045,14 +7119,186 @@ class VanCtlHmiCard extends LitElement {
       }
 
       .tb-cfg {
+        width: 44px;
+        height: 44px;
+        border-radius: 22px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
         cursor: pointer;
         color: var(--sv-text-secondary);
-        opacity: 0.6;
-        transition: opacity 0.2s;
+        background: transparent;
+        transition: background 0.15s, color 0.15s;
+        touch-action: manipulation;
+        -webkit-tap-highlight-color: transparent;
+      }
+      .tb-cfg:hover  { background: rgba(255,255,255,0.06); color: var(--sv-text-primary); }
+      .tb-cfg:active { background: rgba(255,255,255,0.10); }
+      .tb-cfg.active { background: var(--sv-accent-muted); color: var(--sv-accent); }
+
+      /* ── Nav drawer ────────────────────────────────────── */
+
+      .nd-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.55);
+        z-index: 9000;
+        display: flex;
+        justify-content: flex-end;
+        animation: nd-fade-in 0.18s ease-out;
+      }
+      @keyframes nd-fade-in {
+        from { background: rgba(0, 0, 0, 0); }
+        to   { background: rgba(0, 0, 0, 0.55); }
       }
 
-      .tb-cfg:hover { opacity: 1; }
-      .tb-cfg.active { opacity: 1; color: var(--sv-accent); }
+      .nd-panel {
+        background: var(--sv-bg-surface);
+        border-left: 1px solid var(--sv-border);
+        width: min(360px, 100%);
+        height: 100dvh;
+        display: flex;
+        flex-direction: column;
+        box-shadow: -12px 0 40px rgba(0, 0, 0, 0.5);
+        animation: nd-slide-in 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+      }
+      @keyframes nd-slide-in {
+        from { transform: translateX(100%); }
+        to   { transform: translateX(0); }
+      }
+
+      .nd-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 16px 18px;
+        border-bottom: 1px solid var(--sv-border-subtle);
+        flex-shrink: 0;
+      }
+      .nd-title {
+        font-size: 17px;
+        font-weight: 600;
+        color: var(--sv-text-heading);
+      }
+      .nd-close {
+        width: 44px;
+        height: 44px;
+        border-radius: 22px;
+        background: var(--sv-bg-elevated);
+        border: 1px solid var(--sv-border);
+        color: var(--sv-text-secondary);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        touch-action: manipulation;
+        transition: background 0.15s, color 0.15s;
+      }
+      .nd-close:hover { background: var(--sv-border); color: var(--sv-text-primary); }
+
+      .nd-body {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        padding: 8px 10px 16px;
+        overscroll-behavior: contain;
+      }
+
+      .nd-section-label {
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 1.5px;
+        text-transform: uppercase;
+        color: var(--sv-text-disabled);
+        padding: 16px 12px 6px;
+      }
+
+      .nd-row {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 14px 12px;
+        background: transparent;
+        border: none;
+        border-radius: 10px;
+        color: var(--sv-text-primary);
+        cursor: pointer;
+        touch-action: manipulation;
+        -webkit-tap-highlight-color: transparent;
+        min-height: 56px;
+        font-family: inherit;
+        text-align: left;
+      }
+      .nd-row:hover  { background: var(--sv-bg-elevated); }
+      .nd-row:active { background: var(--sv-border-subtle); }
+
+      .nd-row-icon { color: var(--sv-text-secondary); flex-shrink: 0; }
+      .nd-row-label {
+        flex: 1;
+        font-size: 16px;
+        font-weight: 500;
+        color: var(--sv-text-primary);
+      }
+      .nd-row-state {
+        font-size: 13px;
+        color: var(--sv-text-secondary);
+        background: var(--sv-bg-elevated);
+        padding: 4px 10px;
+        border-radius: 12px;
+      }
+      .nd-row-state.on {
+        color: var(--sv-accent);
+        background: var(--sv-accent-muted);
+      }
+      .nd-row-chevron {
+        color: var(--sv-text-disabled);
+        --mdc-icon-size: 20px;
+      }
+
+      /* ── Climate panel edge tab ────────────────────────── */
+
+      .ct-tab {
+        position: fixed;
+        right: 0;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 32px;
+        height: 140px;
+        border-radius: 14px 0 0 14px;
+        background: var(--sv-bg-elevated);
+        border: 1px solid var(--sv-border);
+        border-right: none;
+        color: var(--sv-text-secondary);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        padding: 14px 0;
+        box-shadow: -4px 0 16px rgba(0, 0, 0, 0.35);
+        cursor: pointer;
+        touch-action: manipulation;
+        -webkit-tap-highlight-color: transparent;
+        transition: background 0.15s, color 0.15s, transform 0.18s;
+        z-index: 50;
+      }
+      .ct-tab:hover  { background: var(--sv-border); color: var(--sv-text-primary); }
+      .ct-tab:active { transform: translateY(-50%) translateX(-1px); }
+      .ct-tab.open {
+        background: var(--sv-accent-muted);
+        color: var(--sv-accent);
+        border-color: transparent;
+      }
+      .ct-tab-chev { flex-shrink: 0; }
+      .ct-tab-label {
+        writing-mode: vertical-rl;
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 1.5px;
+        text-transform: uppercase;
+        user-select: none;
+      }
 
       /* ── Main content ──────────────────────────────────── */
 
@@ -7155,23 +7401,57 @@ class VanCtlHmiCard extends LitElement {
         border-top: 1px solid var(--sv-border);
       }
 
+      /* Right panel collapsed — lights take the full width */
+      .control-area.solo-left {
+        grid-template-columns: 1fr;
+      }
+      .control-area.solo-left .lp-panel {
+        border-right: none;
+      }
+
+      /* Below this width, side-by-side would squeeze the lights panel narrower
+         than 2 tile-columns can fit. Stack instead so the lights grid keeps the
+         same column count whether the right panel is open or closed. */
+      @media (max-width: 900px) {
+        .control-area {
+          grid-template-columns: 1fr;
+          grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+        }
+        .control-area.solo-left {
+          grid-template-rows: 1fr;
+        }
+        .lp-panel {
+          border-right: none;
+          border-bottom: 1px solid var(--sv-border);
+        }
+        .control-area.solo-left .lp-panel {
+          border-bottom: none;
+        }
+      }
+
       /* ── Lights panel (left) ───────────────────────────── */
 
       .lp-panel {
         padding: 16px 20px;
         overflow-y: auto;
         border-right: 1px solid var(--sv-border);
+        touch-action: pan-y;
+        overscroll-behavior: contain;
+        /* Enables @container queries below — tile column count is driven by
+           the panel's actual width, not the viewport, so side-by-side mode
+           shrinks the columns correctly. */
+        container-type: inline-size;
       }
 
       .lp-panel::-webkit-scrollbar { width: 3px; }
       .lp-panel::-webkit-scrollbar-thumb { background: var(--sv-border); border-radius: 2px; }
 
       .lp-label {
-        font-size: 12px;
+        font-size: 14px;
         color: var(--sv-text-disabled);
         text-transform: uppercase;
         letter-spacing: 1px;
-        margin: 0 0 12px;
+        margin: 0 0 16px;
         font-weight: 600;
       }
 
@@ -7185,8 +7465,21 @@ class VanCtlHmiCard extends LitElement {
 
       .lp-list {
         display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 8px;
+        grid-template-columns: 1fr;
+        gap: 12px;
+      }
+
+      /* Column count is driven by .lp-panel's width (container query).
+         Bumped breakpoints so each tile has room for icon + name + 48px power
+         button without text truncation at typical names. */
+      @container (min-width: 600px) {
+        .lp-list { grid-template-columns: repeat(2, 1fr); }
+      }
+      @container (min-width: 880px) {
+        .lp-list { grid-template-columns: repeat(3, 1fr); }
+      }
+      @container (min-width: 1160px) {
+        .lp-list { grid-template-columns: repeat(4, 1fr); }
       }
 
       .lp-add-btn {
@@ -7211,14 +7504,16 @@ class VanCtlHmiCard extends LitElement {
       .lp-row {
         display: flex;
         flex-direction: column;
-        gap: 8px;
-        padding: 12px;
+        gap: 14px;
+        padding: 18px;
+        min-height: 96px;
         background: var(--sv-bg-surface);
         border: 1px solid var(--sv-border);
         border-radius: var(--sv-radius);
         transition: all 0.25s;
         user-select: none;
         cursor: pointer;
+        touch-action: manipulation;
       }
 
       .lp-row:active:not(.unavail):not(.expanded) { transform: scale(0.99); }
@@ -7233,9 +7528,10 @@ class VanCtlHmiCard extends LitElement {
       .lp-header {
         display: flex;
         align-items: center;
-        gap: 12px;
+        gap: 16px;
         width: 100%;
         cursor: pointer;
+        min-height: 48px;
       }
 
       .lp-icon { flex-shrink: 0; }
@@ -7247,7 +7543,9 @@ class VanCtlHmiCard extends LitElement {
         background: none;
         border: none;
         cursor: pointer;
-        padding: 4px;
+        padding: 12px;
+        min-width: 48px;
+        min-height: 48px;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -7255,12 +7553,14 @@ class VanCtlHmiCard extends LitElement {
         transition: background 0.15s;
       }
       .lp-power:hover { background: rgba(255,255,255,0.05); }
+      .lp-power:active { background: rgba(255,255,255,0.1); }
 
       .lp-name {
-        font-size: 13px;
+        font-size: 17px;
+        font-weight: 500;
         display: flex;
         align-items: center;
-        gap: 4px;
+        gap: 6px;
         min-width: 0;
       }
 
@@ -7272,9 +7572,9 @@ class VanCtlHmiCard extends LitElement {
       }
 
       .lp-type {
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 500;
-        padding: 1px 5px;
+        padding: 2px 6px;
         border-radius: 4px;
         background: var(--sv-bg-surface);
         border: 1px solid var(--sv-border);
@@ -7284,44 +7584,9 @@ class VanCtlHmiCard extends LitElement {
       }
 
       .lp-bri {
-        font-size: 11px;
+        font-size: 14px;
         color: var(--sv-text-disabled);
-        margin-top: 1px;
-      }
-
-      .lp-slider-wrap {
-        position: relative;
-        width: 100%;
-        height: 32px;
-        border-radius: 16px;
-        background: rgba(255,255,255,0.06);
-        touch-action: none;
-        cursor: pointer;
-      }
-      .lp-slider-track {
-        position: absolute;
-        inset: 0;
-        border-radius: 16px;
-        overflow: hidden;
-      }
-      .lp-slider-fill {
-        height: 100%;
-        background: var(--lp-color, var(--sv-accent));
-        opacity: 0.25;
-        width: calc(16px + (100% - 32px) * var(--lp-bri, 0) / 100);
-      }
-      .lp-slider-thumb {
-        position: absolute;
-        top: 50%;
-        left: calc(16px + (100% - 32px) * var(--lp-bri, 0) / 100);
-        width: 26px;
-        height: 26px;
-        border-radius: 50%;
-        background: var(--lp-color, var(--sv-accent));
-        border: 2.5px solid #fff;
-        box-shadow: 0 1px 4px rgba(0,0,0,0.4);
-        transform: translate(-50%, -50%);
-        pointer-events: none;
+        margin-top: 3px;
       }
 
       /* ── Right panel (climate / level swipeable) ────────── */
@@ -7976,10 +8241,11 @@ class VanCtlHmiCard extends LitElement {
         border-radius: var(--sv-radius);
         width: 100%;
         max-width: 400px;
+        max-height: 90dvh;
         display: flex;
         flex-direction: column;
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-        overflow: visible;
+        overflow: hidden;
       }
       .fm-modal.fm-wide { max-width: 900px; }
 
@@ -8106,6 +8372,9 @@ class VanCtlHmiCard extends LitElement {
         display: flex;
         flex-direction: column;
         gap: 14px;
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
       }
 
       .fm-field {
@@ -8646,6 +8915,7 @@ class VanCtlHmiCard extends LitElement {
         border-radius: 14px;
         width: 100%;
         max-width: 400px;
+        max-height: 90dvh;
         display: flex;
         flex-direction: column;
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
@@ -8685,6 +8955,8 @@ class VanCtlHmiCard extends LitElement {
         gap: 12px;
         padding: 16px;
         overflow-y: auto;
+        flex: 1;
+        min-height: 0;
       }
 
       .auto-field {

@@ -2,8 +2,12 @@ import {
   LitElement,
   html,
   css,
+  nothing,
 } from "lit";
+import { live } from "lit/directives/live.js";
 import { COLOR_PRESETS, sharedTileStyles } from "../smartvanio-shared.js";
+
+const SLIDER_THROTTLE_MS = 150;
 
 class VanCtlTileLight extends LitElement {
   static get properties() {
@@ -22,6 +26,51 @@ class VanCtlTileLight extends LitElement {
     super();
     this._dragState = new Map();
     this._expandedSegColor = null;
+    // Per-entity throttle state: { lastSent: ms, pending: timeoutId, pendingValue: number }
+    this._sendThrottle = new Map();
+  }
+
+  disconnectedCallback() {
+    super.disconnectedCallback();
+    for (const t of this._sendThrottle.values()) {
+      if (t.pending) clearTimeout(t.pending);
+    }
+    this._sendThrottle.clear();
+  }
+
+  // Throttle live brightness updates during drag so we send roughly every
+  // SLIDER_THROTTLE_MS, with a trailing call to make sure the final value
+  // lands even if it arrived inside the throttle window.
+  _throttledSendBrightness(eid, brightness) {
+    const now = performance.now();
+    let t = this._sendThrottle.get(eid);
+    if (!t) {
+      t = { lastSent: 0, pending: null, pendingValue: brightness };
+      this._sendThrottle.set(eid, t);
+    }
+    t.pendingValue = brightness;
+    const elapsed = now - t.lastSent;
+    if (elapsed >= SLIDER_THROTTLE_MS) {
+      if (t.pending) { clearTimeout(t.pending); t.pending = null; }
+      t.lastSent = now;
+      this._setBrightness(eid, brightness);
+      return;
+    }
+    if (t.pending) return; // trailing call already queued, value will pick up pendingValue
+    t.pending = setTimeout(() => {
+      const tt = this._sendThrottle.get(eid);
+      if (!tt) return;
+      tt.lastSent = performance.now();
+      tt.pending = null;
+      this._setBrightness(eid, tt.pendingValue);
+    }, SLIDER_THROTTLE_MS - elapsed);
+  }
+
+  _flushBrightness(eid, brightness) {
+    const t = this._sendThrottle.get(eid);
+    if (t?.pending) { clearTimeout(t.pending); t.pending = null; }
+    if (t) t.lastSent = performance.now();
+    this._setBrightness(eid, brightness);
   }
 
   // ─── Light state helpers ────────────────────────────────────────
@@ -83,13 +132,14 @@ class VanCtlTileLight extends LitElement {
     const brightness = (e.target.value / 100) * 255;
     this._dragState = new Map(this._dragState).set(eid, { active: true, brightness });
     this._updateSliderFill(e.target);
+    this._throttledSendBrightness(eid, brightness);
   }
 
   _onSliderChange(eid, e) {
     const brightness = (e.target.value / 100) * 255;
     this._dragState = new Map(this._dragState).set(eid, { active: false, brightness });
     this._persistBrightness(eid, brightness);
-    this._setBrightness(eid, brightness);
+    this._flushBrightness(eid, brightness);
   }
 
   _updateSliderFill(input) {
@@ -137,7 +187,7 @@ class VanCtlTileLight extends LitElement {
           type="range"
           min="1"
           max="100"
-          .value=${pct}
+          .value=${this._dragState.get(seg.entity_id)?.active ? nothing : live(pct)}
           class="br-slider seg-ctrl-bri"
           style="--sc:rgb(${r},${g},${b}); background:${sliderBg}"
           @input=${(e) => this._onSliderInput(seg.entity_id, e)}
@@ -284,8 +334,22 @@ class VanCtlTileLight extends LitElement {
                   type="range"
                   min="1"
                   max="100"
-                  .value=${pct}
-                  @input=${(e) => this._onSliderInput(entity_id, e)}
+                  .value=${this._dragState.get(entity_id)?.active ? nothing : live(pct)}
+                  @input=${(e) => {
+                    if (segs.length) {
+                      const brightness = (e.target.value / 100) * 255;
+                      const newDrag = new Map(this._dragState);
+                      newDrag.set(entity_id, { active: true, brightness });
+                      segs.forEach((seg) => {
+                        newDrag.set(seg.entity_id, { active: true, brightness });
+                        this._throttledSendBrightness(seg.entity_id, brightness);
+                      });
+                      this._dragState = newDrag;
+                      this._updateSliderFill(e.target);
+                    } else {
+                      this._onSliderInput(entity_id, e);
+                    }
+                  }}
                   @change=${(e) => {
                     if (segs.length) {
                       const brightness = (e.target.value / 100) * 255;
@@ -295,7 +359,7 @@ class VanCtlTileLight extends LitElement {
                       segs.forEach((seg) => {
                         newDrag.set(seg.entity_id, { active: false, brightness });
                         this._persistBrightness(seg.entity_id, brightness);
-                        this._setBrightness(seg.entity_id, brightness);
+                        this._flushBrightness(seg.entity_id, brightness);
                       });
                       this._dragState = newDrag;
                     } else {

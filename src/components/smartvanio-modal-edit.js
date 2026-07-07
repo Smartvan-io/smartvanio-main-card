@@ -40,6 +40,7 @@ class VanCtlModalEdit extends LitElement {
       saveError:        { type: String, attribute: "save-error" },
       isButton:         { type: Boolean, attribute: "is-button" },
       isSwitch:         { type: Boolean, attribute: "is-switch" },
+      switchMode:       { type: Object },  // { entityId, options:[], current } for NO/NC relay mode, or null
       isTank:           { type: Boolean, attribute: "is-tank" },
       isLight:          { type: Boolean, attribute: "is-light" },
       isSensor:         { type: Boolean, attribute: "is-sensor" },
@@ -62,6 +63,7 @@ class VanCtlModalEdit extends LitElement {
     this._rightTab = null; // null = auto-select based on entity type
     this._modalView = null; // null = auto ('control' for lights, 'settings' otherwise)
     this.maxLeds = 0;
+    this.switchMode = null;
     this.calPoints = null;
     this.calKind = "linear";
     this.targetEntities = [];
@@ -321,25 +323,36 @@ class VanCtlModalEdit extends LitElement {
           <ha-icon icon="mdi:chevron-${open ? 'up' : 'down'}" style="--mdc-icon-size:18px; margin-left:auto; opacity:0.5"></ha-icon>
         </button>
         ${open ? html`
-          <div class="area-picker-dropdown">
-            <input class="area-picker-search" type="text" placeholder="Search areas…"
-              .value=${this._areaFilter ?? ''}
-              @input=${(e) => { this._areaFilter = e.target.value; }}
-            />
-            <div class="area-picker-list">
-              ${selectedName ? html`
-                <div class="area-picker-item clear" @click=${() => { this._emit("smartvanio-update-edit-area", { value: '' }); this._areaPickerOpen = false; }}>
-                  <ha-icon icon="mdi:close" style="--mdc-icon-size:16px"></ha-icon><span>Clear</span>
-                </div>
-              ` : ''}
-              ${filtered.map(a => html`
-                <div class="area-picker-item ${a.name === selectedName ? 'selected' : ''}"
-                  @click=${() => { this._emit("smartvanio-update-edit-area", { value: a.name }); this._areaPickerOpen = false; }}>
-                  <ha-icon icon="${a.icon || 'mdi:map-marker'}" style="--mdc-icon-size:16px"></ha-icon>
-                  <span>${a.name}</span>
-                </div>
-              `)}
-              ${!filtered.length ? html`<div class="area-picker-empty">No areas found</div>` : ''}
+          <div class="area-picker-overlay"
+            @click=${(e) => { if (e.target === e.currentTarget) this._areaPickerOpen = false; }}>
+            <div class="area-picker-sheet" @click=${(e) => e.stopPropagation()}>
+              <div class="area-picker-sheet-header">
+                <span class="area-picker-sheet-title">Select area</span>
+                <button class="area-picker-sheet-close" @click=${() => { this._areaPickerOpen = false; }} aria-label="Close">
+                  <ha-icon icon="mdi:close" style="--mdc-icon-size:22px"></ha-icon>
+                </button>
+              </div>
+              <input class="area-picker-search" type="search"
+                inputmode="search" enterkeyhint="search" autocomplete="off"
+                placeholder="Search areas…"
+                .value=${this._areaFilter ?? ''}
+                @input=${(e) => { this._areaFilter = e.target.value; }}
+              />
+              <div class="area-picker-list">
+                ${selectedName ? html`
+                  <div class="area-picker-item clear" @click=${() => { this._emit("smartvanio-update-edit-area", { value: '' }); this._areaPickerOpen = false; }}>
+                    <ha-icon icon="mdi:close" style="--mdc-icon-size:18px"></ha-icon><span>Clear selection</span>
+                  </div>
+                ` : ''}
+                ${filtered.map(a => html`
+                  <div class="area-picker-item ${a.name === selectedName ? 'selected' : ''}"
+                    @click=${() => { this._emit("smartvanio-update-edit-area", { value: a.name }); this._areaPickerOpen = false; }}>
+                    <ha-icon icon="${a.icon || 'mdi:map-marker'}" style="--mdc-icon-size:20px"></ha-icon>
+                    <span>${a.name}</span>
+                  </div>
+                `)}
+                ${!filtered.length ? html`<div class="area-picker-empty">No areas found</div>` : ''}
+              </div>
             </div>
           </div>
         ` : ''}
@@ -1145,6 +1158,18 @@ class VanCtlModalEdit extends LitElement {
                       ${this._renderAreaPicker()}
                     </div>
 
+                    ${this.isSwitch && this.switchMode ? html`
+                    <div class="modal-section">
+                      <label class="modal-label">Relay Mode</label>
+                      <smartvanio-select
+                        .value=${this.switchMode.current}
+                        .options=${(this.switchMode.options ?? []).map(o => ({ value: o, label: o }))}
+                        @smartvanio-change=${(e) => this._emit("smartvanio-set-switch-mode", { value: e.detail.value })}
+                      ></smartvanio-select>
+                      <p class="switch-mode-hint">Choose "Normally Closed" for relays wired NC, so this switch reflects the device's real power state (on = circuit closed).</p>
+                    </div>
+                    ` : ""}
+
                     ${this.isTank ? this._renderCalibrationSection() : ""}
                   </div>
 
@@ -1425,10 +1450,10 @@ class VanCtlModalEdit extends LitElement {
           inset: 0;
           background: rgba(0, 0, 0, 0.55);
           display: flex;
-          align-items: center;
+          align-items: stretch;
           justify-content: center;
           z-index: 1000;
-          padding: 16px;
+          padding: 0;
         }
 
         .modal {
@@ -1436,7 +1461,9 @@ class VanCtlModalEdit extends LitElement {
           border-radius: 16px;
           width: 100%;
           max-width: 1060px;
-          max-height: 90vh;
+          max-height: 100dvh;
+          height: 100dvh;
+          border-radius: 0;
           display: flex;
           flex-direction: column;
           box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
@@ -1486,6 +1513,7 @@ class VanCtlModalEdit extends LitElement {
           padding: 18px;
           overflow-y: auto;
           flex: 1;
+          min-height: 0;
           display: flex;
           flex-direction: column;
           gap: 20px;
@@ -1502,6 +1530,13 @@ class VanCtlModalEdit extends LitElement {
           gap: 20px;
           flex: 1;
           min-width: 0;
+        }
+
+        .switch-mode-hint {
+          margin: 8px 0 0;
+          font-size: 12px;
+          line-height: 1.4;
+          color: var(--secondary-text-color);
         }
 
         .modal-col-right {
@@ -2516,61 +2551,121 @@ class VanCtlModalEdit extends LitElement {
         .area-picker-placeholder {
           color: var(--secondary-text-color, #888);
         }
-        .area-picker-dropdown {
-          position: absolute;
-          top: 100%;
-          left: 0;
-          right: 0;
-          margin-top: 4px;
+        /* ── Area picker sheet (full-screen modal, escapes parent clipping) ── */
+        .area-picker-overlay {
+          position: fixed;
+          inset: 0;
+          background: rgba(0, 0, 0, 0.55);
+          z-index: 10000;
+          display: flex;
+          align-items: flex-start;
+          justify-content: center;
+          animation: ap-fade-in 0.18s ease-out;
+        }
+        @keyframes ap-fade-in {
+          from { background: rgba(0, 0, 0, 0); }
+          to   { background: rgba(0, 0, 0, 0.55); }
+        }
+        .area-picker-sheet {
           background: var(--card-background-color, #fff);
           border: 1px solid var(--divider-color, rgba(0,0,0,0.12));
-          border-radius: 8px;
-          box-shadow: 0 4px 16px rgba(0,0,0,0.25);
-          z-index: 10;
-          overflow: hidden;
+          border-radius: 0 0 18px 18px;
+          width: min(640px, 100%);
+          max-height: 92dvh;
+          display: flex;
+          flex-direction: column;
+          padding: 14px;
+          gap: 12px;
+          box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+          animation: ap-slide-down 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        @keyframes ap-slide-down {
+          from { transform: translateY(-20px); opacity: 0; }
+          to   { transform: translateY(0);     opacity: 1; }
+        }
+        .area-picker-sheet-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+          padding: 2px 4px;
+        }
+        .area-picker-sheet-title {
+          font-size: 17px;
+          font-weight: 600;
+          color: var(--primary-text-color);
+        }
+        .area-picker-sheet-close {
+          width: 44px;
+          height: 44px;
+          flex-shrink: 0;
+          background: var(--secondary-background-color, #f5f5f5);
+          border: 1px solid var(--divider-color, rgba(0,0,0,0.08));
+          border-radius: 22px;
+          color: var(--secondary-text-color);
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          transition: background 0.15s;
+        }
+        .area-picker-sheet-close:hover {
+          background: var(--divider-color, rgba(0,0,0,0.12));
+          color: var(--primary-text-color);
         }
         .area-picker-search {
           width: 100%;
-          padding: 10px 12px;
-          border: none;
-          border-bottom: 1px solid var(--divider-color, rgba(0,0,0,0.12));
-          background: transparent;
-          color: var(--primary-text-color);
-          font-size: 14px;
+          font-size: 16px;  /* >=16px prevents iOS auto-zoom on focus */
           font-family: inherit;
+          padding: 14px 16px;
+          border: 1px solid var(--divider-color, rgba(0,0,0,0.12));
+          border-radius: 12px;
+          background: var(--secondary-background-color, #f5f5f5);
+          color: var(--primary-text-color);
           outline: none;
           box-sizing: border-box;
+          transition: border-color 0.15s;
         }
+        .area-picker-search:focus { border-color: var(--primary-color); }
         .area-picker-list {
-          max-height: 180px;
+          flex: 1;
+          min-height: 0;
           overflow-y: auto;
+          overscroll-behavior: contain;
+          touch-action: pan-y;
+          margin: 0 -4px;
+          padding: 0 4px 4px;
         }
         .area-picker-item {
           display: flex;
           align-items: center;
-          gap: 8px;
-          padding: 8px 12px;
+          gap: 12px;
+          padding: 12px 14px;
           cursor: pointer;
-          font-size: 14px;
+          font-size: 15px;
+          border-radius: 10px;
           transition: background 0.15s;
+          touch-action: manipulation;
         }
-        .area-picker-item:hover {
-          background: var(--secondary-background-color, #f5f5f5);
-        }
+        .area-picker-item:hover { background: var(--secondary-background-color, #f5f5f5); }
+        .area-picker-item:active { background: var(--divider-color, rgba(0,0,0,0.08)); }
         .area-picker-item.selected {
           color: var(--primary-color);
-          font-weight: 500;
+          font-weight: 600;
+          background: color-mix(in srgb, var(--primary-color, #4a9eff) 12%, transparent);
         }
         .area-picker-item.clear {
           color: var(--error-color, #db4437);
-          font-size: 13px;
+          font-size: 14px;
           border-bottom: 1px solid var(--divider-color, rgba(0,0,0,0.08));
+          margin-bottom: 4px;
+          border-radius: 10px 10px 0 0;
         }
         .area-picker-empty {
-          padding: 12px;
+          padding: 24px 16px;
           text-align: center;
           color: var(--secondary-text-color, #888);
-          font-size: 13px;
+          font-size: 14px;
         }
 
         /* ── Modal header actions ──── */
@@ -2763,8 +2858,6 @@ class VanCtlModalEdit extends LitElement {
         }
 
         @media (max-width: 768px) {
-          .modal-overlay { padding: 8px; }
-          .modal { max-height: 95vh; }
           .modal-header { padding: 12px 14px; font-size: 15px; }
           .modal-body { padding: 14px; gap: 16px; }
           .modal-input {

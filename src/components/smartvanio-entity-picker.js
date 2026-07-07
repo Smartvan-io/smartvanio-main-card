@@ -3,6 +3,9 @@ import { LitElement, html, css } from "lit";
 /**
  * Rich entity picker with search, icons, and live values.
  *
+ * When opened, presents a full-screen bottom-sheet modal so the on-screen
+ * keyboard on tablets doesn't shrink/hide the picker's search input or list.
+ *
  * Usage:
  *   <smartvanio-entity-picker
  *     .hass=${this.hass}
@@ -39,21 +42,29 @@ class SmartVanEntityPicker extends LitElement {
     this.placeholder = "Select entity";
     this._open = false;
     this._search = "";
-    this._onDocClick = (e) => {
-      if (!this._open) return;
-      const path = e.composedPath();
-      if (!path.includes(this)) this._open = false;
+    this._onKeydown = (e) => {
+      if (e.key === "Escape" && this._open) this._close();
     };
   }
 
   connectedCallback() {
     super.connectedCallback();
-    document.addEventListener("pointerdown", this._onDocClick, true);
+    document.addEventListener("keydown", this._onKeydown);
   }
 
   disconnectedCallback() {
     super.disconnectedCallback();
-    document.removeEventListener("pointerdown", this._onDocClick, true);
+    document.removeEventListener("keydown", this._onKeydown);
+  }
+
+  updated(changedProps) {
+    // Auto-focus the search input when the sheet opens so the user can start
+    // typing immediately. RAF ensures the element is in the DOM first.
+    if (changedProps.has("_open") && this._open) {
+      requestAnimationFrame(() => {
+        this.shadowRoot?.querySelector(".ep-search")?.focus();
+      });
+    }
   }
 
   _getEntities() {
@@ -132,33 +143,13 @@ class SmartVanEntityPicker extends LitElement {
     return val;
   }
 
-  _toggleOpen() {
-    this._open = !this._open;
-    this._search = "";
-    if (this._open) {
-      requestAnimationFrame(() => this._positionDropdown());
-    }
-  }
+  _open_() { this._open = true; this._search = ""; }
+  _close() { this._open = false; this._search = ""; }
 
-  _positionDropdown() {
-    const sel = this.shadowRoot?.querySelector('.selected');
-    const dd = this.shadowRoot?.querySelector('.dropdown');
-    if (!sel || !dd) return;
-    const rect = sel.getBoundingClientRect();
-    dd.style.left = `${rect.left}px`;
-    dd.style.width = `${rect.width}px`;
-    // Check if dropdown fits below, otherwise open above
-    const spaceBelow = window.innerHeight - rect.bottom - 8;
-    const ddHeight = Math.min(300, dd.scrollHeight);
-    if (spaceBelow >= ddHeight || spaceBelow >= rect.top) {
-      dd.style.top = `${rect.bottom + 4}px`;
-      dd.style.bottom = 'auto';
-      dd.style.maxHeight = `${Math.min(300, spaceBelow)}px`;
-    } else {
-      dd.style.bottom = `${window.innerHeight - rect.top + 4}px`;
-      dd.style.top = 'auto';
-      dd.style.maxHeight = `${Math.min(300, rect.top - 8)}px`;
-    }
+  _onOverlayClick(e) {
+    // Only dismiss when the tap lands on the backdrop itself, not propagated
+    // from the sheet.
+    if (e.target === e.currentTarget) this._close();
   }
 
   render() {
@@ -169,7 +160,7 @@ class SmartVanEntityPicker extends LitElement {
 
     return html`
       <div class="picker">
-        <div class="selected" @click=${() => this._toggleOpen()}>
+        <div class="selected" @click=${() => this._open_()}>
           ${this.value ? html`
             <ha-icon class="sel-icon" icon="${selIcon}" style="--mdc-icon-size:18px"></ha-icon>
             <span class="sel-name">${selName}</span>
@@ -180,47 +171,61 @@ class SmartVanEntityPicker extends LitElement {
           `}
           <span class="chevron"></span>
         </div>
-        ${this._open ? html`
-          <div class="dropdown">
-            <input class="search" type="text" placeholder="Search entities..."
-              .value=${this._search}
-              @input=${(e) => { this._search = e.target.value; }}
-              @click=${(e) => e.stopPropagation()} />
-            <div class="list">
-              ${this.pinnedEntity && this.hass?.states?.[this.pinnedEntity] ? (() => {
-                const ps = this.hass.states[this.pinnedEntity];
-                const pn = ps.attributes?.friendly_name ?? this.pinnedEntity.split(".").pop().replace(/_/g, " ");
-                const pi = ps.attributes?.icon || this._domainIcon(this.pinnedEntity);
-                return html`
-                  <div class="option pinned ${this.pinnedEntity === this.value ? 'active' : ''}"
-                       @click=${() => this._select(this.pinnedEntity)}>
-                    <ha-icon class="opt-icon" icon="${pi}" style="--mdc-icon-size:18px"></ha-icon>
-                    <div class="opt-info">
-                      <span class="opt-name">${pn}</span>
-                      <span class="opt-eid">${this.pinnedEntity}</span>
-                    </div>
-                    <span class="pinned-badge">this entity</span>
-                  </div>
-                  <div class="pinned-divider"></div>
-                `;
-              })() : ""}
-              ${this._filtered().filter(e => e.eid !== this.pinnedEntity).map((e) => html`
-                <div class="option ${e.eid === this.value ? 'active' : ''}"
-                     @click=${() => this._select(e.eid)}>
-                  <ha-icon class="opt-icon" icon="${e.icon}" style="--mdc-icon-size:18px"></ha-icon>
-                  <div class="opt-info">
-                    <span class="opt-name">${e.name}</span>
-                    <span class="opt-eid">${e.eid}</span>
-                  </div>
-                  <span class="opt-val">${this._formatVal(e.val, e.unit)}</span>
-                </div>
-              `)}
-              ${this._filtered().filter(e => e.eid !== this.pinnedEntity).length === 0 && !this.pinnedEntity ? html`
-                <div class="no-results">No entities found</div>
-              ` : ""}
-            </div>
+        ${this._open ? this._renderSheet() : ""}
+      </div>
+    `;
+  }
+
+  _renderSheet() {
+    const pinned = this.pinnedEntity && this.hass?.states?.[this.pinnedEntity];
+    const pinnedState = pinned ? this.hass.states[this.pinnedEntity] : null;
+    const pinnedName = pinnedState?.attributes?.friendly_name ?? (pinned ? this.pinnedEntity.split(".").pop().replace(/_/g, " ") : "");
+    const pinnedIcon = pinnedState?.attributes?.icon || (pinned ? this._domainIcon(this.pinnedEntity) : "");
+    const others = this._filtered().filter((e) => e.eid !== this.pinnedEntity);
+
+    return html`
+      <div class="ep-overlay" @click=${this._onOverlayClick}>
+        <div class="ep-sheet" @click=${(e) => e.stopPropagation()}>
+          <div class="ep-header">
+            <span class="ep-title">${this.placeholder ?? "Select entity"}</span>
+            <button class="ep-close" @click=${() => this._close()} aria-label="Close">
+              <ha-icon icon="mdi:close" style="--mdc-icon-size:22px"></ha-icon>
+            </button>
           </div>
-        ` : ""}
+          <input class="ep-search" type="search"
+            inputmode="search" enterkeyhint="search" autocomplete="off"
+            placeholder="Search entities..."
+            .value=${this._search}
+            @input=${(e) => { this._search = e.target.value; }} />
+          <div class="ep-list">
+            ${pinned ? html`
+              <div class="option pinned ${this.pinnedEntity === this.value ? "active" : ""}"
+                   @click=${() => this._select(this.pinnedEntity)}>
+                <ha-icon class="opt-icon" icon="${pinnedIcon}" style="--mdc-icon-size:22px"></ha-icon>
+                <div class="opt-info">
+                  <span class="opt-name">${pinnedName}</span>
+                  <span class="opt-eid">${this.pinnedEntity}</span>
+                </div>
+                <span class="pinned-badge">this entity</span>
+              </div>
+              <div class="pinned-divider"></div>
+            ` : ""}
+            ${others.map((e) => html`
+              <div class="option ${e.eid === this.value ? "active" : ""}"
+                   @click=${() => this._select(e.eid)}>
+                <ha-icon class="opt-icon" icon="${e.icon}" style="--mdc-icon-size:22px"></ha-icon>
+                <div class="opt-info">
+                  <span class="opt-name">${e.name}</span>
+                  <span class="opt-eid">${e.eid}</span>
+                </div>
+                <span class="opt-val">${this._formatVal(e.val, e.unit)}</span>
+              </div>
+            `)}
+            ${others.length === 0 && !pinned ? html`
+              <div class="no-results">No entities found</div>
+            ` : ""}
+          </div>
+        </div>
       </div>
     `;
   }
@@ -247,7 +252,7 @@ class SmartVanEntityPicker extends LitElement {
 
       .sel-icon { color: var(--sv-text-secondary, #888); flex-shrink: 0; }
       .sel-name { flex: 1; font-size: 13px; color: var(--sv-text-primary, #fff); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .sel-val { font-size: 12px; color: var(--sv-accent, #4a9eff); flex-shrink: 0; }
+      .sel-val  { font-size: 12px; color: var(--sv-accent, #4a9eff); flex-shrink: 0; }
       .sel-placeholder { flex: 1; font-size: 13px; color: var(--sv-text-secondary, #888); }
       .sel-clear {
         background: none; border: none; color: var(--sv-text-secondary, #888);
@@ -263,87 +268,153 @@ class SmartVanEntityPicker extends LitElement {
         border-top: 5px solid var(--sv-text-secondary, #888);
       }
 
-      .dropdown {
+      /* ── Picker sheet (full-screen modal) ───────────────────── */
+
+      .ep-overlay {
         position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.55);
         z-index: 10000;
-        background: var(--sv-bg-elevated, #1E1E2A);
+        display: flex;
+        align-items: flex-start;
+        justify-content: center;
+        animation: ep-fade-in 0.18s ease-out;
+      }
+
+      @keyframes ep-fade-in {
+        from { background: rgba(0, 0, 0, 0); }
+        to   { background: rgba(0, 0, 0, 0.55); }
+      }
+
+      .ep-sheet {
+        background: var(--sv-bg-overlay, #161B22);
         border: 1px solid var(--sv-border, rgba(255,255,255,0.08));
-        border-radius: 8px;
-        box-shadow: 0 8px 24px rgba(0,0,0,0.5);
-        overflow: hidden;
+        border-radius: 0 0 18px 18px;
+        width: min(640px, 100%);
+        max-height: 92dvh;
         display: flex;
         flex-direction: column;
+        padding: 14px;
+        gap: 12px;
+        box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+        animation: ep-slide-down 0.22s cubic-bezier(0.16, 1, 0.3, 1);
       }
 
-      .search {
-        width: 100%;
-        padding: 10px 12px;
-        border: none;
-        border-bottom: 1px solid var(--sv-border, rgba(255,255,255,0.08));
-        background: transparent;
+      @keyframes ep-slide-down {
+        from { transform: translateY(-20px); opacity: 0; }
+        to   { transform: translateY(0);     opacity: 1; }
+      }
+
+      .ep-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 2px 4px;
+      }
+      .ep-title {
+        font-size: 17px;
+        font-weight: 600;
         color: var(--sv-text-primary, #fff);
-        font-size: 13px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .ep-close {
+        width: 44px;
+        height: 44px;
+        flex-shrink: 0;
+        background: var(--sv-bg-elevated, #1E1E2A);
+        border: 1px solid var(--sv-border, rgba(255,255,255,0.08));
+        border-radius: 22px;
+        color: var(--sv-text-secondary, #888);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: background 0.15s, color 0.15s;
+      }
+      .ep-close:hover { background: var(--sv-border, #2A2A38); color: var(--sv-text-primary, #fff); }
+      .ep-close:active { background: var(--sv-bg-input, #212830); }
+
+      .ep-search {
+        width: 100%;
+        font-size: 16px;        /* >=16px prevents iOS Safari auto-zoom on focus */
         font-family: inherit;
+        padding: 14px 16px;
+        border: 1px solid var(--sv-border, rgba(255,255,255,0.08));
+        border-radius: 12px;
+        background: var(--sv-bg-input, #212830);
+        color: var(--sv-text-primary, #fff);
         outline: none;
         box-sizing: border-box;
+        transition: border-color 0.15s;
       }
-      .search::placeholder { color: var(--sv-text-secondary, #888); }
+      .ep-search:focus { border-color: var(--sv-accent, #4a9eff); }
+      .ep-search::placeholder { color: var(--sv-text-secondary, #888); }
 
-      .list {
+      .ep-list {
         flex: 1;
-        overflow-y: auto;
         min-height: 0;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        touch-action: pan-y;
+        margin: 0 -4px;
+        padding: 0 4px 4px;
       }
-      .list::-webkit-scrollbar { width: 4px; }
-      .list::-webkit-scrollbar-thumb { background: var(--sv-border, #333); border-radius: 2px; }
+      .ep-list::-webkit-scrollbar { width: 4px; }
+      .ep-list::-webkit-scrollbar-thumb { background: var(--sv-border, #333); border-radius: 2px; }
 
       .option {
         display: flex;
         align-items: center;
-        gap: 10px;
-        padding: 8px 12px;
+        gap: 12px;
+        padding: 12px 14px;
         cursor: pointer;
+        border-radius: 10px;
         transition: background 0.1s;
+        touch-action: manipulation;
       }
       .option:hover { background: var(--sv-bg-surface, #16161E); }
-      .option.active { background: color-mix(in srgb, var(--sv-accent, #4a9eff) 12%, transparent); }
+      .option:active { background: var(--sv-bg-elevated, #1E1E2A); }
+      .option.active { background: color-mix(in srgb, var(--sv-accent, #4a9eff) 14%, transparent); }
 
       .opt-icon { color: var(--sv-text-secondary, #888); flex-shrink: 0; }
-      .opt-info { flex: 1; display: flex; flex-direction: column; gap: 1px; min-width: 0; }
-      .opt-name { font-size: 13px; color: var(--sv-text-primary, #fff); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .opt-eid { font-size: 10px; color: var(--sv-text-secondary, #666); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .opt-val { font-size: 12px; color: var(--sv-accent, #4a9eff); flex-shrink: 0; white-space: nowrap; }
+      .opt-info { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+      .opt-name { font-size: 15px; color: var(--sv-text-primary, #fff); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .opt-eid  { font-size: 11px; color: var(--sv-text-secondary, #666); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .opt-val  { font-size: 13px; color: var(--sv-accent, #4a9eff); flex-shrink: 0; white-space: nowrap; }
 
       .option.pinned {
         background: color-mix(in srgb, var(--sv-accent, #4a9eff) 8%, transparent);
       }
       .option.pinned:hover {
-        background: color-mix(in srgb, var(--sv-accent, #4a9eff) 15%, transparent);
+        background: color-mix(in srgb, var(--sv-accent, #4a9eff) 16%, transparent);
       }
 
       .pinned-badge {
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.5px;
         color: var(--sv-accent, #4a9eff);
-        background: color-mix(in srgb, var(--sv-accent, #4a9eff) 15%, transparent);
-        padding: 2px 6px;
-        border-radius: 4px;
+        background: color-mix(in srgb, var(--sv-accent, #4a9eff) 18%, transparent);
+        padding: 3px 7px;
+        border-radius: 5px;
         flex-shrink: 0;
       }
 
       .pinned-divider {
         height: 1px;
         background: var(--sv-border, rgba(255,255,255,0.08));
-        margin: 2px 0;
+        margin: 6px 4px;
       }
 
       .no-results {
-        padding: 16px;
+        padding: 24px 16px;
         text-align: center;
         color: var(--sv-text-secondary, #888);
-        font-size: 13px;
+        font-size: 14px;
       }
     `;
   }

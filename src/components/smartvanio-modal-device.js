@@ -479,7 +479,7 @@ class SmartVanModalDevice extends LitElement {
         border-radius: 16px;
         width: 100%;
         max-width: 680px;
-        max-height: 88vh;
+        max-height: 88dvh;
         display: flex;
         flex-direction: column;
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
@@ -546,6 +546,7 @@ class SmartVanModalDevice extends LitElement {
         padding: 18px 22px;
         overflow-y: auto;
         flex: 1;
+        min-height: 0;
         display: flex;
         flex-direction: column;
         gap: 16px;
