@@ -17,9 +17,11 @@
 import {
   LitElement,
   html,
+  svg,
   css,
 } from "lit";
 import { repeat } from "lit/directives/repeat.js";
+import uPlot from "uplot";
 import { animate } from "motion";
 import { GridDragController } from "./grid-drag-controller.js";
 import {
@@ -36,6 +38,10 @@ import "./components/smartvanio-icon-picker.js";
 import "./components/smartvanio-modal-edit.js";
 import "./components/smartvanio-modal-scene.js";
 import "./components/smartvanio-modal-device.js";
+
+/** Colour temperature an RGB strip comes up at when switched on and nothing
+ *  more specific is configured. 2700K — the warm white of a domestic bulb. */
+const SV_DEFAULT_ON_KELVIN = 2700;
 import "./components/smartvanio-tile-light.js";
 import "./components/smartvanio-tile-switch.js";
 import "./components/smartvanio-tile-tank.js";
@@ -47,6 +53,15 @@ import { Pagination } from "swiper/modules";
 
 
 // ── Tab definitions ───────────────────────────────────────
+// Primary views. Tabs live in the top bar so any view is one tap away — the
+// tablet is used standing at the door, not browsed through a menu.
+const VIEWS = [
+  { id: 'lighting', label: 'Lighting', icon: 'mdi:lightbulb-group' },
+  { id: 'relays',   label: 'Switches', icon: 'mdi:power-plug' },
+  { id: 'comfort',  label: 'Comfort',  icon: 'mdi:thermostat' },
+  { id: 'power',    label: 'Power',    icon: 'mdi:battery-charging' },
+];
+
 const TABS = [
   { id: "climate", icon: "mdi:thermometer", label: "Climate" },
   { id: "scenes", icon: "mdi:palette", label: "Scenes" },
@@ -118,13 +133,24 @@ class VanCtlHmiCard extends LitElement {
       _lightPatterns:   { type: Object },
       _maxLeds:         { type: Number },
       _switchMode:      { type: Object },
+      _powerOnState:    { type: Object },   // { entityId, options:[], current } for light power-on state, or null
+      _inputMode:       { type: Object },   // { entityId, options:[], current } for a resistive input's Sensor/Switch mode, or null
+      _calPoints:       { type: Array },
+      _calKind:         { type: String },
+      _resourceEdit:    { type: Object },
+      _flowHistory:     { type: Object },
+      _lightView:       { type: String },
+      _lightGroups:     { type: Array },
+      _pwrHours:        { type: Number },
+      _switchEdit:      { type: Object },
+      _confirmAction:   { type: Object },
       _footerModal:     { type: Object },  // { key, idx, item, type } or null
       _footerAddMenu:   { type: Boolean },
       _lightModal:      { type: Object },  // { item, isNew } or null — add/edit light modal
       _activePatterns:  { type: Object },  // Map<entity_id, patternName> of currently applied patterns
       _layoutMode:      { type: Boolean },
       _layoutDrag:      { type: Object },  // { type, fromIdx, overIdx } or null
-      _page:            { type: String },   // 'dashboard' | 'devices'
+      _page:            { type: String },   // 'lighting' | 'relays' | 'level' | 'power' | 'devices'
       _deviceModal:     { type: Object },   // { device, deviceId, entities, inCardEids } or null
       _theme:           { type: String },
       _showRightPanel:  { type: Boolean },
@@ -188,8 +214,35 @@ class VanCtlHmiCard extends LitElement {
     this._tankLpTimer     = null;
     this._layoutMode      = false;
     this._layoutDrag      = null;
-    this._page            = 'dashboard';
+    this._page            = 'lighting';
     this._deviceModal     = null;
+    this._powerOnState    = null;
+    this._onColorSetting  = '';     // Kelvin or 'last' for the light being edited
+    this._inputMode       = null;
+    this._calPoints       = null;   // [[volts, pct], ...] or null when not calibratable
+    this._calKind         = 'linear';
+    this._calPointsEid    = null;   // text.* holding the points
+    this._calKindEid      = null;   // select.* holding the interpolation kind
+    this._calRawEid       = null;   // sensor.* raw voltage, for the live readout
+    this._calMinResEid    = null;   // number.* min resistance
+    this._calMaxResEid    = null;   // number.* max resistance
+    this._calMinRes       = '';
+    this._calMaxRes       = '';
+    this._calSnapshot     = null;   // values as the modal opened, for Cancel
+    this._calDirty        = false;  // something was written through since opening
+    this._calPushTimer    = null;
+    this._resourceEdit    = null;   // { idx, name, color, icon } when this entity is a footer resource
+    this._lightView       = 'lights';  // 'lights' | 'groups' on the Lighting page
+    this._lightGroups     = null;   // group membership of the light being edited
+    this._flowHistory     = null;   // combined watt-denominated power flow
+    this._flowLoading     = false;
+    this._flowPlot        = null;   // uPlot instance
+    this._flowPlotSig     = null;   // rebuild only when the series set or size changes
+    this._flowDataRef     = null;   // history object the canvas was last drawn from
+    this._flowRO          = null;   // { eid, hours, unit, pts:[[ms,val]], min, max }
+    this._pwrHours        = 6;      // a day of SmartShunt samples is slow to move
+    this._switchEdit      = null;   // { idx, name, color, icon, confirm } for a footer switch
+    this._confirmAction   = null;   // { eid, name, turningOn } pending confirmation
     this._sceneConfigs    = {};  // { configId: { entities: {...} } }
     this._sceneConfigsLoaded = false;
     this._entityPatterns  = {};  // { "light.foo": { "Sunset": [{pos,r,g,b}, ...] } }
@@ -234,6 +287,7 @@ class VanCtlHmiCard extends LitElement {
   }
 
   updated(changedProps) {
+    try { this._syncFlowPlot(); } catch (err) { console.warn('[smartvanio] uplot sync failed', err); }
     super.updated?.(changedProps);
     if (changedProps.has("_selectedId")) {
       if (this._mqttUnsub) {
@@ -271,6 +325,15 @@ class VanCtlHmiCard extends LitElement {
   }
 
   disconnectedCallback() {
+    this._flowRO?.obs.disconnect();
+    this._flowRO = null;
+    cancelAnimationFrame(this._flowRAF);
+    if (this._flowPlot) {
+      this._flowPlot.destroy();
+      this._flowPlot = null;
+      this._flowPlotSig = null;
+      this._flowDataRef = null;
+    }
     super.disconnectedCallback();
     document.removeEventListener('keydown', this._onNavKeydown);
     this._destroySwiper();
@@ -520,6 +583,7 @@ class VanCtlHmiCard extends LitElement {
         hiddenScenes: ps.hiddenScenes ?? [],
         lightOrder: ps.lightOrder ?? [],
         hiddenLights: ps.hiddenLights ?? [],
+        hiddenSwitches: ps.hiddenSwitches ?? [],
       };
     }
 
@@ -571,6 +635,7 @@ class VanCtlHmiCard extends LitElement {
       hiddenScenes: cfgSlots.hiddenScenes ?? [],
       lightOrder: cfgSlots.lightOrder ?? [],
       hiddenLights: cfgSlots.hiddenLights ?? [],
+      hiddenSwitches: cfgSlots.hiddenSwitches ?? [],
     };
   }
 
@@ -804,11 +869,99 @@ class VanCtlHmiCard extends LitElement {
     );
   }
 
+  /** One target state for the whole group: if any member is on, all go off;
+   *  otherwise all come on. Per-member toggling would leave a mixed group
+   *  mixed forever. */
   _toggleGroup(group) {
-    const service = this._isGroupOn(group) ? "turn_off" : "turn_on";
-    for (const eid of group.lights ?? [])
-      this.hass.callService("light", service, { entity_id: eid });
+    const turnOff = this._isGroupOn(group);
+    for (const eid of group.lights ?? []) {
+      if (!this.hass.states[eid]) continue;
+      if (turnOff) {
+        this.hass.callService('light', 'turn_off', { entity_id: eid });
+      } else {
+        const data = { entity_id: eid };
+        const rgb = this._getActivePatternName(eid) ? null : this._onColorFor(eid);
+        if (rgb) { data.rgb_color = rgb; data.effect = 'None'; }
+        this.hass.callService('light', 'turn_on', data);
+      }
+    }
   }
+
+  /** Groups as the edit modal sees them: every group, flagged with whether
+   *  this light is in it. Null for non-lights so the section stays hidden. */
+  _groupsForLight(eid) {
+    if (!eid?.startsWith('light.')) return null;
+    return (this._resolveSlots()?.groups ?? []).map((g) => ({
+      id: g.id,
+      name: g.name ?? 'Group',
+      member: (g.lights ?? []).includes(eid),
+    }));
+  }
+
+  /** Group writes persist immediately — the modal's Save covers name/area/rows,
+   *  and a half-applied group would show up straight away in the Groups tab. */
+  _writeGroups(mutate) {
+    const slots = this._resolveSlots() ?? {};
+    const groups = mutate([...(slots.groups ?? [])]);
+    if (!groups) return;
+    slots.groups = groups;
+    this._cardConfig = { ...this._cardConfig, slots };
+    this._saveMqttConfig();
+    this._lightGroups = this._groupsForLight(this._editingEntity);
+    this.requestUpdate();
+  }
+
+  _toggleGroupMember(groupId) {
+    const eid = this._editingEntity;
+    if (!eid) return;
+    this._writeGroups((groups) => {
+      const i = groups.findIndex((g) => g.id === groupId);
+      if (i < 0) return null;
+      const members = groups[i].lights ?? [];
+      groups[i] = {
+        ...groups[i],
+        lights: members.includes(eid) ? members.filter((x) => x !== eid) : [...members, eid],
+      };
+      return groups;
+    });
+  }
+
+  _renameGroup(groupId, name) {
+    const clean = (name ?? '').trim();
+    if (!clean) return;
+    this._writeGroups((groups) => {
+      const i = groups.findIndex((g) => g.id === groupId);
+      if (i < 0) return null;
+      groups[i] = { ...groups[i], name: clean };
+      return groups;
+    });
+  }
+
+  _deleteGroup(groupId) {
+    this._writeGroups((groups) => groups.filter((g) => g.id !== groupId));
+  }
+
+  /** A new group starts with the light you created it from already in it —
+   *  creating an empty group from a light's own settings would be a dead end. */
+  _createGroup(name) {
+    const eid = this._editingEntity;
+    const clean = (name ?? '').trim();
+    if (!clean) return;
+    this._writeGroups((groups) => [
+      ...groups,
+      { id: `grp_${Date.now()}`, name: clean, lights: eid ? [eid] : [], scenes: [] },
+    ]);
+  }
+
+  _groupCounts(group) {
+    const members = (group.lights ?? []).filter((eid) => this.hass.states[eid]);
+    return { on: members.filter((eid) => this.hass.states[eid]?.state === 'on').length,
+             total: members.length };
+  }
+
+
+
+
 
   _groupBrightness(group) {
     const vals = (group.lights ?? [])
@@ -1021,7 +1174,8 @@ class VanCtlHmiCard extends LitElement {
       const slotIds = new Set(slotMapped.map((e) => e.eid));
       return [...slotMapped, ...discovered.filter((e) => !slotIds.has(e.eid))];
     };
-    const lights = mergeEntities(slots?.lights, safeEntities.lights);
+    const lights = mergeEntities(slots?.lights, safeEntities.lights)
+      .filter((l) => l.eid?.startsWith('light.'));
     const powerSwitches = mergeEntities(slots?.switches, this._powerSwitches?.(safeEntities.switches) ?? []);
     const groups = slots?.groups ?? [];
     return this._orderedTiles(groups, lights, powerSwitches, null);
@@ -2354,8 +2508,54 @@ class VanCtlHmiCard extends LitElement {
     return groups;
   }
 
+  /** Automation targets may be a single id (legacy) or an array. */
+  _targetList(target) {
+    if (Array.isArray(target)) return target.filter(Boolean);
+    return target ? [target] : [];
+  }
+
+  /** These strips are WS2811 — RGB only, no white channel — so a colour
+   *  temperature has to be mixed out of R, G and B. Tanner Helland's
+   *  approximation, which is accurate enough between 1000K and 40000K. */
+  _kelvinToRgb(kelvin) {
+    const t = Math.max(1000, Math.min(40000, kelvin)) / 100;
+    const clamp = (v) => Math.max(0, Math.min(255, Math.round(v)));
+    let r, g, b;
+    if (t <= 66) {
+      r = 255;
+      g = 99.4708025861 * Math.log(t) - 161.1195681661;
+      b = t <= 19 ? 0 : 138.5177312231 * Math.log(t - 10) - 305.0447927307;
+    } else {
+      r = 329.698727446 * Math.pow(t - 60, -0.1332047592);
+      g = 288.1221695283 * Math.pow(t - 60, -0.0755148492);
+      b = 255;
+    }
+    return [clamp(r), clamp(g), clamp(b)];
+  }
+
+  /** Colour a light should come up at when switched on, or null to leave the
+   *  firmware to restore whatever it had last. Configured per light in the
+   *  edit modal; unset lights fall back to warm white, because an RGB strip
+   *  with no stored colour comes up at flat 6500K white. */
+  _onColorFor(eid) {
+    if (!eid?.startsWith('light.')) return null;
+    // Spotlights are monochromatic PWM channels — they have no colour to set,
+    // and rgb_color on a brightness-only light is rejected by HA.
+    const modes = this.hass?.states?.[eid]?.attributes?.supported_color_modes ?? [];
+    if (!modes.some((m) => ['rgb', 'rgbw', 'rgbww', 'hs', 'xy'].includes(m))) return null;
+    const k = this._resolveSlots()?.onColor?.[eid] ?? SV_DEFAULT_ON_KELVIN;
+    if (k === 'last') return null;
+    const n = parseInt(k, 10);
+    return Number.isNaN(n) ? null : this._kelvinToRgb(n);
+  }
+
   _buildAutomationConfig(entity_id, gesture, target_entity_id, action, extra = {}) {
-    const domain = target_entity_id.split(".")[0];
+    const targets = this._targetList(target_entity_id);
+    const multi = targets.length > 1;
+    // Mixed-domain targets can't use a domain service, and homeassistant.*
+    // works for light/switch/fan/cover alike.
+    const domains = new Set(targets.map(t => t.split(".")[0]));
+    const domain = domains.size === 1 ? [...domains][0] : "homeassistant";
     const label = this._label(entity_id);
     const gestureName =
       { press: "Press", double_press: "Double Press", hold: "Hold", above: `Above ${extra.threshold ?? ''}`, below: `Below ${extra.threshold ?? ''}` }[gesture] ??
@@ -2364,24 +2564,56 @@ class VanCtlHmiCard extends LitElement {
       smartvanio: true,
       entity_id,
       gesture,
-      target_entity_id,
+      target_entity_id: multi ? targets : (targets[0] ?? ""),
       action,
       ...extra,
     });
 
     // Build the action sequence based on the action type
+    const tgt = { entity_id: multi ? targets : targets[0] };
+
+    // Physical switches call these automations, so the switch-on colour has to
+    // travel with them. Only meaningful for a pure-light target set: the
+    // homeassistant.* fallback used for mixed domains takes no colour.
+    const onData = {};
+    if (domain === 'light') {
+      const rgbs = targets.map((t) => this._onColorFor(t)).filter(Boolean);
+      // Targets can disagree; a single service call can only carry one colour,
+      // so only send it when the whole set wants the same one.
+      const same = rgbs.length === targets.length &&
+        rgbs.every((c) => c.join() === rgbs[0].join());
+      if (same) { onData.rgb_color = rgbs[0]; onData.effect = 'None'; }
+    }
+    const withOn = (act) => (Object.keys(onData).length ? { ...act, data: { ...onData, ...(act.data ?? {}) } } : act);
     let svcActions;
     if (action === "turn_on_for") {
       const minutes = parseInt(extra.duration ?? 5, 10);
       svcActions = [
-        { action: `${domain}.turn_on`, target: { entity_id: target_entity_id } },
+        withOn({ action: `${domain}.turn_on`, target: tgt }),
         { delay: { minutes } },
-        { action: `${domain}.turn_off`, target: { entity_id: target_entity_id } },
+        { action: `${domain}.turn_off`, target: tgt },
       ];
     } else if (action === "set_brightness") {
       const pct = parseInt(extra.brightness_pct ?? 50, 10);
       svcActions = [
-        { action: "light.turn_on", target: { entity_id: target_entity_id }, data: { brightness_pct: pct } },
+        { action: "light.turn_on", target: tgt, data: { brightness_pct: pct } },
+      ];
+    } else if (action === "toggle" && multi) {
+      // Per-entity toggle would invert each target independently, so a group
+      // that starts out mixed stays mixed forever. Decide ONE target state for
+      // the whole set: if any is on, turn them all off; otherwise all on.
+      svcActions = [
+        {
+          choose: [
+            {
+              conditions: [
+                { condition: "state", entity_id: targets, state: "on", match: "any" },
+              ],
+              sequence: [{ action: `${domain}.turn_off`, target: tgt }],
+            },
+          ],
+          default: [withOn({ action: `${domain}.turn_on`, target: tgt })],
+        },
       ];
     } else {
       // Map custom action names to HA service calls
@@ -2392,8 +2624,11 @@ class VanCtlHmiCard extends LitElement {
         close_cover: "cover.close_cover",
         stop_cover: "cover.stop_cover",
       }[action] ?? `${domain}.${action}`;
+      // light.toggle takes the same data as light.turn_on and applies it on
+      // the on transition, so a single-target toggle carries the colour too.
       svcActions = [
-        { action: svcName, target: { entity_id: target_entity_id } },
+        (action === 'turn_on' || action === 'toggle') ? withOn({ action: svcName, target: tgt })
+                                                      : { action: svcName, target: tgt },
       ];
     }
 
@@ -2907,13 +3142,10 @@ class VanCtlHmiCard extends LitElement {
     // edit modal can expose it as a dropdown (firmware owns the invert logic).
     this._switchMode = null;
     if (entity_id.startsWith("switch.")) {
-      const info = this._resolveEntityTopic(entity_id);
-      if (info?.deviceId && info?.channel) {
-        const wantUnique = `${info.deviceId}_${info.channel}_mode`;
-        const selEid = Object.keys(this.hass.entities ?? {}).find(
-          (eid) => eid.startsWith("select.") &&
-                   this.hass.entities[eid]?.unique_id === wantUnique,
-        );
+      const channel = entity_id.split(".")[1]?.match(/_(relay_\d+|[a-z]+_[a-z])$/)?.[1]
+        ?? this._resolveEntityTopic(entity_id)?.channel;
+      if (channel) {
+        const selEid = this._findCompanionOnDevice("select", entity_id, channel + "_mode");
         if (selEid) {
           const st = this.hass.states[selEid];
           this._switchMode = {
@@ -2922,6 +3154,126 @@ class VanCtlHmiCard extends LitElement {
             current: st?.state ?? "Normally Open",
           };
         }
+      }
+    }
+    // For SmartVan.io lights, find the firmware-provided power-on-state select
+    // so the edit modal can expose it (firmware applies it at boot).
+    this._powerOnState = null;
+    if (entity_id.startsWith("light.")) {
+      const channel = this._resolveEntityTopic(entity_id)?.channel
+        ?? entity_id.split(".")[1]?.match(/_(spot_\d+|led_strip_\d+)$/)?.[1];
+      if (channel) {
+        const selEid = this._findCompanionOnDevice("select", entity_id, channel + "_power_on_state");
+        if (selEid) {
+          const st = this.hass.states[selEid];
+          this._powerOnState = {
+            entityId: selEid,
+            options: st?.attributes?.options ?? ["Restore", "On", "Off"],
+            current: st?.state ?? "Restore",
+          };
+        }
+      }
+    }
+    // Resistive-sensor inputs: expose the firmware's Sensor / Switch (NO) /
+    // Switch (NC) mode select. Firmware owns the polarity logic; this is just
+    // the control for it.
+    this._inputMode = null;
+    if (entity_id.startsWith("sensor.") || entity_id.startsWith("binary_sensor.")) {
+      const prefix = entity_id.match(/_(sensor_\d+)_/)?.[1];
+      if (prefix) {
+        const selEid = this._findCompanionOnDevice("select", entity_id, prefix + "_mode");
+        if (selEid) {
+          const st = this.hass.states[selEid];
+          this._inputMode = {
+            entityId: selEid,
+            options: st?.attributes?.options ?? ["Sensor", "Switch (NO)", "Switch (NC)"],
+            current: st?.state ?? "Sensor",
+          };
+        }
+      }
+    }
+    this._lightGroups = this._groupsForLight(entity_id);
+
+    {
+      const modes = this.hass?.states?.[entity_id]?.attributes?.supported_color_modes ?? [];
+      const colorCapable = entity_id.startsWith('light.') &&
+        modes.some((m) => ['rgb', 'rgbw', 'rgbww', 'hs', 'xy'].includes(m));
+      this._onColorSetting = colorCapable
+        ? String(this._resolveSlots()?.onColor?.[entity_id] ?? SV_DEFAULT_ON_KELVIN)
+        : '';
+    }
+
+    // Calibration, for resistive interpolated sensors. Points live in the
+    // firmware's companion text entity and the curve type in its select, so we
+    // read those rather than keeping a separate copy.
+    this._calPoints = null;
+    this._calKind = 'linear';
+    this._calPointsEid = this._calKindEid = this._calRawEid = null;
+    if (entity_id.startsWith('sensor.')) {
+      const prefix = entity_id.match(/_(sensor_\d+)_/)?.[1];
+      if (prefix) {
+        this._calPointsEid = this._findCompanionOnDevice('text', entity_id, prefix + '_interpolation_points');
+        this._calKindEid = this._findCompanionOnDevice('select', entity_id, prefix + '_interpolation_kind');
+        this._calRawEid = this._findCompanionOnDevice('sensor', entity_id, prefix + '_raw');
+        // HA appends _2 to these object_ids on this firmware, so match loosely.
+        this._calMinResEid = this._findCompanionOnDevice('number', entity_id, prefix + '_min_resistance')
+          ?? this._findCompanionOnDevice('number', entity_id, prefix + '_min_resistance_2');
+        this._calMaxResEid = this._findCompanionOnDevice('number', entity_id, prefix + '_max_resistance')
+          ?? this._findCompanionOnDevice('number', entity_id, prefix + '_max_resistance_2');
+        this._calMinRes = this._calMinResEid ? (this.hass.states[this._calMinResEid]?.state ?? '') : '';
+        this._calMaxRes = this._calMaxResEid ? (this.hass.states[this._calMaxResEid]?.state ?? '') : '';
+        if (this._calPointsEid) {
+          try {
+            const parsed = JSON.parse(this.hass.states[this._calPointsEid]?.state ?? '[]');
+            this._calPoints = Array.isArray(parsed) ? parsed : [];
+          } catch {
+            this._calPoints = [];
+          }
+          this._calKind = this._calKindEid
+            ? (this.hass.states[this._calKindEid]?.state ?? 'linear')
+            : 'linear';
+        }
+      }
+    }
+    // Calibration edits apply live so their effect on the reading is visible
+    // while tuning; this is what Cancel puts back.
+    this._calSnapshot = this._calPointsEid ? {
+      points: JSON.stringify(this._calPoints ?? []),
+      kind:   this._calKind,
+      min:    this._calMinRes,
+      max:    this._calMaxRes,
+    } : null;
+    this._calDirty = false;
+    clearTimeout(this._calPushTimer);
+    this._calPushTimer = null;
+    // If this entity is a footer resource, surface its label/colour/icon here
+    // too — previously that meant entering setup mode and using a second modal.
+    this._resourceEdit = null;
+    {
+      const res = this._resolveSlots()?.resources ?? [];
+      const idx = res.findIndex((r) => r.entity === entity_id);
+      if (idx >= 0) {
+        this._resourceEdit = {
+          idx,
+          name: res[idx].name ?? '',
+          color: res[idx].color ?? '#4a9eff',
+          icon: res[idx].icon ?? '',
+        };
+      }
+    }
+    // Footer switch appearance + confirmation policy, same idea as resources.
+    this._switchEdit = null;
+    {
+      const sws = this._resolveSlots()?.footerSwitches ?? [];
+      const idx = sws.findIndex((sw) => sw.entity === entity_id);
+      if (idx >= 0) {
+        this._switchEdit = {
+          idx,
+          name: sws[idx].name ?? '',
+          color: sws[idx].color ?? '#4a9eff',
+          icon: sws[idx].icon ?? '',
+          confirm: sws[idx].confirm ?? 'never',
+        };
       }
     }
     this._editLoading = true;
@@ -2951,12 +3303,13 @@ class VanCtlHmiCard extends LitElement {
             const meta = JSON.parse(cfg.description ?? "{}");
             if (!meta.smartvanio) continue;
             // Match automations where this entity is either the source or the target
-            if (meta.entity_id === entity_id || meta.target_entity_id === entity_id) {
+            const metaTargets = this._targetList(meta.target_entity_id);
+            if (meta.entity_id === entity_id || metaTargets.includes(entity_id)) {
               rows.push({
                 id: configKey,
                 source_entity_id: meta.entity_id ?? "",
                 gesture: meta.gesture ?? meta.event ?? "",
-                target_entity_id: meta.target_entity_id ?? "",
+                target_entity_id: metaTargets.length > 1 ? metaTargets : (metaTargets[0] ?? ""),
                 action: meta.action ?? "",
                 duration: meta.duration ?? "",
                 brightness_pct: meta.brightness_pct ?? "",
@@ -3067,10 +3420,238 @@ class VanCtlHmiCard extends LitElement {
     });
   }
 
-  async _saveEdit({ entity_id, name, area, rows, lightSegments, maxLeds }) {
+  // Apply a light's power-on state immediately via the firmware's companion
+  // select entity (firmware applies it on boot; "Restore" keeps last state).
+  _setPowerOnState(value) {
+    if (!this._powerOnState?.entityId) return;
+    this._powerOnState = { ...this._powerOnState, current: value };
+    this.hass.callService("select", "select_option", {
+      entity_id: this._powerOnState.entityId,
+      option: value,
+    });
+  }
+
+  _updateCalPoint({ index, field, value }) {
+    if (field === 'kind') { this._calKind = value; this._pushCalibration(); return; }
+    const pts = (this._calPoints ?? []).map((pt) => [...pt]);
+    if (!pts[index]) return;
+    const n = parseFloat(value);
+    pts[index][field] = Number.isNaN(n) ? 0 : n;
+    this._calPoints = pts;
+    this._pushCalibration();
+  }
+
+  /** A fresh row is [0, 0] until it is filled in — pushing that immediately
+   *  would drag the live reading toward zero, so the write waits for a value. */
+  _addCalPoint() { this._calPoints = [...(this._calPoints ?? []), [0, 0]]; }
+
+  /** Persisted immediately: the value is baked into the automations that
+   *  physical switches fire, so it has to survive independently of Save. */
+  _setOnColor(value) {
+    const eid = this._editingEntity;
+    if (!eid) return;
+    this._onColorSetting = String(value);
+    const slots = this._resolveSlots() ?? {};
+    slots.onColor = { ...(slots.onColor ?? {}), [eid]: String(value) };
+    this._cardConfig = { ...this._cardConfig, slots };
+    this._saveMqttConfig();
+    this._rebuildAutomationsFor(eid);
+  }
+
+  /** The colour is baked into each automation's action data, so automations
+   *  already pointing at this light have to be regenerated when it changes.
+   *  Same scan as the edit modal uses: [VanCtl] automations whose description
+   *  metadata names this entity as a target. */
+  async _rebuildAutomationsFor(eid) {
+    const autos = Object.entries(this.hass?.states ?? {}).filter(
+      ([e, st]) => e.startsWith('automation.') &&
+                   st.attributes?.friendly_name?.startsWith('[VanCtl]'),
+    );
+    for (const [autoEid, autoState] of autos) {
+      const configKey = this.hass.entities?.[autoEid]?.unique_id
+        ?? autoState.attributes?.id;
+      if (!configKey) continue;
+      try {
+        const cfg = await this.hass.callApi('GET', `config/automation/config/${configKey}`);
+        const meta = JSON.parse(cfg.description ?? '{}');
+        if (!meta.smartvanio) continue;
+        if (!this._targetList(meta.target_entity_id).includes(eid)) continue;
+        const extra = {};
+        for (const k of ['duration', 'brightness_pct', 'threshold']) {
+          if (meta[k] !== undefined && meta[k] !== '') extra[k] = meta[k];
+        }
+        const rebuilt = this._buildAutomationConfig(
+          meta.entity_id, meta.gesture ?? meta.event, meta.target_entity_id, meta.action, extra,
+        );
+        await this.hass.callApi('POST', `config/automation/config/${configKey}`, rebuilt);
+      } catch (err) {
+        console.warn('[smartvanio] could not rewrite automation', configKey, err);
+      }
+    }
+  }
+
+  /** Fill a row's voltage from the sensor's live raw reading — the normal way
+   *  to calibrate: fill the tank to a known level, then capture. */
+  _captureVoltage({ index }) {
+    const v = parseFloat(this.hass?.states?.[this._calRawEid]?.state);
+    if (Number.isNaN(v)) return;
+    const pts = (this._calPoints ?? []).map((pt) => [...pt]);
+    if (!pts[index]) return;
+    pts[index][0] = Math.round(v * 1000) / 1000;
+    this._calPoints = pts;
+    this._pushCalibration();
+  }
+
+  /** Write the working points and curve to the firmware so the reading updates
+   *  as they are edited. Debounced: a Save-less UI would otherwise publish on
+   *  every field blur, and each write is an MQTT round trip.
+   *
+   *  Points go up sorted because interpolation needs ascending voltage, but
+   *  this._calPoints is left in edit order so rows do not jump under the
+   *  cursor mid-edit. */
+  _pushCalibration() {
+    if (!this._calPointsEid) return;
+    this._calDirty = true;
+    clearTimeout(this._calPushTimer);
+    this._calPushTimer = setTimeout(() => {
+      this._calPushTimer = null;
+      const sorted = (this._calPoints ?? [])
+        .map((pt) => [parseFloat(pt[0]) || 0, parseFloat(pt[1]) || 0])
+        .sort((a, b) => a[0] - b[0]);
+      this.hass.callService('text', 'set_value', {
+        entity_id: this._calPointsEid,
+        value: JSON.stringify(sorted),
+      }).catch((err) => console.warn('[smartvanio] calibration push failed', err));
+      if (this._calKindEid && this._calKind) {
+        this.hass.callService('select', 'select_option', {
+          entity_id: this._calKindEid,
+          option: this._calKind,
+        }).catch((err) => console.warn('[smartvanio] curve push failed', err));
+      }
+    }, 250);
+  }
+
+  /** Put the firmware back to the values the modal opened with. */
+  _revertCalibration() {
+    const snap = this._calSnapshot;
+    if (!snap || !this._calDirty) return;
+    clearTimeout(this._calPushTimer);
+    this._calPushTimer = null;
+    if (this._calPointsEid) {
+      this.hass.callService('text', 'set_value',
+        { entity_id: this._calPointsEid, value: snap.points })
+        .catch((err) => console.warn('[smartvanio] calibration revert failed', err));
+    }
+    if (this._calKindEid && snap.kind) {
+      this.hass.callService('select', 'select_option',
+        { entity_id: this._calKindEid, option: snap.kind })
+        .catch(() => {});
+    }
+    for (const [eid, val] of [[this._calMinResEid, snap.min], [this._calMaxResEid, snap.max]]) {
+      const n = parseFloat(val);
+      if (eid && !Number.isNaN(n)) {
+        this.hass.callService('number', 'set_value', { entity_id: eid, value: n })
+          .catch(() => {});
+      }
+    }
+    this._calDirty = false;
+    this._calSnapshot = null;
+  }
+
+  _updateSwitchField({ field, value }) {
+    if (!this._switchEdit) return;
+    this._switchEdit = { ...this._switchEdit, [field]: value };
+  }
+
+  _updateResourceField({ field, value }) {
+    if (!this._resourceEdit) return;
+    this._resourceEdit = { ...this._resourceEdit, [field]: value };
+  }
+
+  /** Min/max resistance are plain number entities — write them immediately
+   *  rather than batching into Save, matching how the mode selects behave. */
+  _updateCalResistance({ field, value }) {
+    const eid = field === 'min' ? this._calMinResEid : this._calMaxResEid;
+    const n = parseFloat(value);
+    if (!eid || Number.isNaN(n)) return;
+    if (field === 'min') this._calMinRes = String(n); else this._calMaxRes = String(n);
+    this._calDirty = true;
+    this.hass.callService('number', 'set_value', { entity_id: eid, value: n });
+  }
+
+  _removeCalPoint(index) {
+    this._calPoints = (this._calPoints ?? []).filter((_, i) => i !== index);
+    this._pushCalibration();
+  }
+
+  // Apply a resistive input's mode via the firmware's companion select.
+  _setInputMode(value) {
+    if (!this._inputMode?.entityId) return;
+    this._inputMode = { ...this._inputMode, current: value };
+    this.hass.callService("select", "select_option", {
+      entity_id: this._inputMode.entityId,
+      option: value,
+    });
+  }
+
+  async _saveEdit({ entity_id, name, area, rows, lightSegments, maxLeds, calPoints, calKind }) {
     this._editSaving = true;
     this._saveError = null;
     this._initialSegments = null; // Don't restore on close after save
+
+    // Footer switch settings live in card config, not on the entity.
+    if (this._switchEdit) {
+      const slots = { ...(this._cardConfig?.slots ?? {}) };
+      const sws = [...(slots.footerSwitches ?? [])];
+      const { idx, name, color, icon, confirm } = this._switchEdit;
+      if (sws[idx]) {
+        sws[idx] = { ...sws[idx], name, color, icon, confirm };
+        slots.footerSwitches = sws;
+        this._cardConfig = { ...this._cardConfig, slots };
+        this._saveMqttConfig();
+      }
+    }
+
+    // Footer resource label/colour/icon live in card config, not on the entity.
+    if (this._resourceEdit) {
+      const slots = { ...(this._cardConfig?.slots ?? {}) };
+      const res = [...(slots.resources ?? [])];
+      const { idx, name, color, icon } = this._resourceEdit;
+      if (res[idx]) {
+        res[idx] = { ...res[idx], name, color, icon };
+        slots.resources = res;
+        this._cardConfig = { ...this._cardConfig, slots };
+        this._saveMqttConfig();
+      }
+    }
+
+    // Calibration has already been written through as it was edited; this
+    // final write just guarantees sorted order, then retires the undo snapshot.
+    clearTimeout(this._calPushTimer);
+    this._calPushTimer = null;
+    if (this._calPointsEid && Array.isArray(calPoints)) {
+      try {
+        const sorted = calPoints
+          .map((pt) => [parseFloat(pt[0]) || 0, parseFloat(pt[1]) || 0])
+          .sort((a, b) => a[0] - b[0]);   // interpolation needs ascending voltage
+        await this.hass.callService('text', 'set_value', {
+          entity_id: this._calPointsEid,
+          value: JSON.stringify(sorted),
+        });
+        if (this._calKindEid && calKind) {
+          await this.hass.callService('select', 'select_option', {
+            entity_id: this._calKindEid,
+            option: calKind,
+          });
+        }
+      } catch (err) {
+        this._saveError = 'Failed to save calibration: ' + (err.message || JSON.stringify(err));
+        this._editSaving = false;
+        return;
+      }
+    }
+    this._calSnapshot = null;
+    this._calDirty = false;
     this._previewTurnedOn = false; // Don't turn off after save
 
     try {
@@ -3085,8 +3666,11 @@ class VanCtlHmiCard extends LitElement {
         });
       }
 
-      // Persist area to hmi_config slots
-      if (area !== undefined) {
+      // Persist area to hmi_config slots. Lights only: _editArea is always a
+      // string, so without this guard every saved entity — relays, tank
+      // sensors, switch inputs — got pushed into slots.lights and then showed
+      // up on the Lighting page.
+      if (area !== undefined && entity_id.startsWith('light.')) {
         const slots = { ...(this._cardConfig?.slots ?? {}) };
         const lights = [...(slots.lights ?? [])];
         const idx = lights.findIndex(l => l.entity === entity_id);
@@ -3122,7 +3706,7 @@ class VanCtlHmiCard extends LitElement {
           if (!row.source_entity_id) missing.push("trigger");
           if (!row.gesture) missing.push("event");
           if (isSensorRow && (row.threshold === undefined || row.threshold === '')) missing.push("threshold value");
-          if (!row.target_entity_id) missing.push("target");
+          if (!this._targetList(row.target_entity_id).length) missing.push("target");
           if (!row.action) missing.push("action");
           if (missing.length) {
             this._saveError = `Incomplete automation row — please fill in: ${missing.join(", ")}`;
@@ -3130,7 +3714,12 @@ class VanCtlHmiCard extends LitElement {
             return;
           }
           const srcSlug = row.source_entity_id.split(".")[1] ?? "unknown";
-          const tgtSlug = row.target_entity_id.split(".")[1] ?? "unknown";
+          const rowTargets = this._targetList(row.target_entity_id);
+          // Key stays stable per (source, gesture, target-set) so editing an
+          // existing rule updates it rather than creating a duplicate.
+          const tgtSlug = rowTargets.length > 1
+            ? `${rowTargets.length}targets_` + rowTargets.map(t => t.split(".")[1] ?? "x").sort().join("_").slice(0, 40)
+            : (rowTargets[0]?.split(".")[1] ?? "unknown");
           const configKey = `smartvanio_${srcSlug}_${row.gesture}_${tgtSlug}`;
           const extra = {};
           if (row.duration) extra.duration = row.duration;
@@ -3270,9 +3859,6 @@ class VanCtlHmiCard extends LitElement {
 
   // ── Service calls ──────────────────────────────────────────
 
-  _toggleLight(eid) {
-    this.hass.callService("light", "toggle", { entity_id: eid });
-  }
   _setBri(eid, v) {
     this.hass.callService("light", "turn_on", {
       entity_id: eid,
@@ -3465,7 +4051,17 @@ class VanCtlHmiCard extends LitElement {
 
     return html`
       <div class="sc-hero">
-        <h2 class="sc-label">Quick Scenes</h2>
+        ${this._layoutMode ? '' : html`
+          <div class="lv-switch" role="tablist">
+            <button class="lv-tab ${this._lightView === 'groups' ? '' : 'active'}" role="tab"
+              aria-selected=${this._lightView !== 'groups'}
+              @click=${() => { this._lightView = 'lights'; }}>Lights</button>
+            <button class="lv-tab ${this._lightView === 'groups' ? 'active' : ''}" role="tab"
+              aria-selected=${this._lightView === 'groups'}
+              @click=${() => { this._lightView = 'groups'; }}>Groups</button>
+          </div>
+          <span class="sc-divider"></span>
+        `}
         <div class="sc-carousel ${this._layoutMode ? 'layout-mode' : ''}">
           ${scenes.map(({eid, state}, i) => {
             const bg = this._sceneCardGradient(eid);
@@ -3485,7 +4081,7 @@ class VanCtlHmiCard extends LitElement {
                       <ha-icon class="layout-eye" icon="${isHidden ? 'mdi:eye-off' : 'mdi:eye'}" style="--mdc-icon-size:16px"></ha-icon>
                     </span>
                   </div>
-                  <ha-icon class="sc-card-icon" icon="${eid.startsWith('script.') ? 'mdi:script-text' : 'mdi:palette'}" style="--mdc-icon-size:28px"></ha-icon>
+                  <ha-icon class="sc-card-icon" icon="${eid.startsWith('script.') ? 'mdi:script-text' : 'mdi:palette'}"></ha-icon>
                   <span class="sc-card-name">${this._label(eid)}</span>
                   ${lightColors.length ? html`
                     <div class="sc-dots">
@@ -3504,7 +4100,7 @@ class VanCtlHmiCard extends LitElement {
                    }}
                    @pointerup=${() => { if (this._sceneLpTimer) clearTimeout(this._sceneLpTimer); }}
                    @pointerleave=${() => { if (this._sceneLpTimer) clearTimeout(this._sceneLpTimer); }}>
-                <ha-icon class="sc-card-icon" icon="${eid.startsWith('script.') ? 'mdi:script-text' : 'mdi:palette'}" style="--mdc-icon-size:28px"></ha-icon>
+                <ha-icon class="sc-card-icon" icon="${eid.startsWith('script.') ? 'mdi:script-text' : 'mdi:palette'}"></ha-icon>
                 <span class="sc-card-name">${this._label(eid)}</span>
                 ${lightColors.length ? html`
                   <div class="sc-dots">
@@ -3518,7 +4114,7 @@ class VanCtlHmiCard extends LitElement {
           })}
           ${!this._layoutMode ? html`
             <div class="sc-card sc-card-add" @click=${() => this._openNewSceneModal()}>
-              <ha-icon icon="mdi:plus" style="--mdc-icon-size:28px; color:var(--sv-text-secondary)"></ha-icon>
+              <ha-icon class="sc-card-icon" icon="mdi:plus" style="color:var(--sv-text-secondary)"></ha-icon>
               <span class="sc-card-name" style="color:var(--sv-text-secondary)">Add Scene</span>
             </div>
           ` : ''}
@@ -3549,13 +4145,102 @@ class VanCtlHmiCard extends LitElement {
       orderedLights = orderedLights.filter(l => !hiddenSet.has(l.eid));
     }
 
-    const onCount = orderedLights.filter(l => l.state?.state === 'on').length;
+    // Group by area, using the same source the overview panel does
+    // (slots.lights[].area). Headers are interleaved into the list as sentinel
+    // items rather than nesting extra containers, so the existing grid columns
+    // and the layout-mode drag indices are both left alone.
+    let listItems = orderedLights;
+    if (!this._layoutMode) {
+      const slotLights = slots.lights ?? [];
+      const areaOf = (eid) =>
+        (slotLights.find(l => l.entity === eid)?.area || '').trim() || 'Unassigned';
+      const byArea = new Map();
+      for (const l of orderedLights) {
+        const a = areaOf(l.eid);
+        if (!byArea.has(a)) byArea.set(a, []);
+        byArea.get(a).push(l);
+      }
+      // Unassigned sinks to the bottom; everything else alphabetical.
+      const areas = [...byArea.keys()].sort((a, b) =>
+        a === 'Unassigned' ? 1 : b === 'Unassigned' ? -1 : a.localeCompare(b));
+      if (areas.length > 1) {
+        listItems = [];
+        for (const a of areas) {
+          const group = byArea.get(a);
+          listItems.push({
+            _area: a,
+            _on: group.filter(l => l.state?.state === 'on').length,
+            _total: group.length,
+          });
+          listItems.push(...group);
+        }
+      }
+    }
+
+    // Groups are configured per light in the edit modal; this view only shows
+    // and switches them. A group with no surviving members is not rendered —
+    // its lights may have been removed from the card since.
+    const groups = (slots.groups ?? []).filter((g) => this._groupCounts(g).total > 0);
+    const showGroups = this._lightView === 'groups' && !this._layoutMode;
 
     return html`
       <div class="lp-panel">
-        <h3 class="lp-label">Lights <span class="lp-count">${onCount} / ${orderedLights.length}</span></h3>
+        ${showGroups ? html`
+          ${groups.length ? '' : html`
+            <p class="sw-empty">
+              No groups yet. Press and hold a light, then use <b>Groups</b> in its
+              settings to create one.
+            </p>`}
+          <div class="lp-list">
+            ${groups.map((g) => {
+              const { on, total } = this._groupCounts(g);
+              const isOn = on > 0;
+              return html`
+                <div class="lp-row grp-row ${isOn ? 'on' : ''}">
+                  <div class="lp-header" @click=${() => this._toggleGroup(g)}>
+                    <ha-icon class="lp-icon" icon="mdi:lightbulb-group"
+                      style="--mdc-icon-size:30px; opacity:${isOn ? 1 : 0.55}; color:${isOn ? 'var(--sv-accent)' : 'var(--sv-text-secondary)'}"></ha-icon>
+                    <div class="lp-info">
+                      <span class="lp-name"><span class="lp-name-text">${g.name}</span></span>
+                      <span class="lp-bri">${on} / ${total} on</span>
+                    </div>
+                    <button class="lp-power"
+                      @click=${(e) => { e.stopPropagation(); this._toggleGroup(g); }}
+                      style="color:${isOn ? 'var(--sv-accent)' : 'var(--sv-text-disabled)'}">
+                      <ha-icon icon="mdi:power" style="--mdc-icon-size:26px"></ha-icon>
+                    </button>
+                  </div>
+                  <div class="grp-members">
+                    ${(g.lights ?? []).filter((eid) => this.hass.states[eid]).map((eid) => {
+                      const st = this.hass.states[eid];
+                      const mOn = st.state === 'on';
+                      const unavail = st.state === 'unavailable' || st.state === 'unknown';
+                      const rgb = st.attributes?.rgb_color;
+                      return html`
+                        <button class="grp-chip ${mOn ? 'on' : ''} ${unavail ? 'unavail' : ''}"
+                          title=${this._label(eid)}
+                          @click=${(e) => { e.stopPropagation(); if (!unavail) this._toggleLight(eid); }}>
+                          <ha-icon icon=${this._lightIcon(eid)}
+                            style="--mdc-icon-size:14px; color:${unavail ? 'var(--sv-red)' : mOn && rgb ? `rgb(${rgb.join(',')})` : mOn ? 'var(--sv-accent)' : 'var(--sv-text-disabled)'}"></ha-icon>
+                          <span>${this._label(eid)}</span>
+                        </button>`;
+                    })}
+                  </div>
+                </div>`;
+            })}
+          </div>
+          ${groups.length ? html`
+            <p class="lv-hint">Groups are set up on each light — press and hold a light, then use Groups.</p>
+          ` : ''}
+        ` : html`
         <div class="lp-list">
-          ${orderedLights.map(({eid, state, _slotName}, i) => {
+          ${listItems.map((item, i) => {
+            if (item._area) return html`
+              <div class="lp-area">
+                <span>${item._area}</span>
+                <span class="lp-count">${item._on} / ${item._total}</span>
+              </div>`;
+            const { eid, state, _slotName } = item;
             const isOn = state?.state === 'on';
             const unavail = !state || state.state === 'unavailable' || state.state === 'unknown';
             const bri = isOn ? Math.round((state?.attributes?.brightness ?? 255) / 2.55) : 0;
@@ -3641,9 +4326,763 @@ class VanCtlHmiCard extends LitElement {
             </div>
           ` : ''}
         </div>
+        `}
       </div>
     `;
   }
+
+  /** Persistent view tabs. Hidden while editing so the Save/Cancel bar in the
+   *  top bar isn't competing with navigation. */
+  _renderViewTabs() {
+    if (this._setupMode || this._layoutMode) return '';
+    const active = VIEWS.some(v => v.id === this._page) ? this._page : 'lighting';
+    return html`
+      <div class="vtabs" role="tablist">
+        ${VIEWS.map(v => html`
+          <button class="vtab ${active === v.id ? 'active' : ''}"
+                  role="tab" aria-selected=${active === v.id}
+                  @click=${() => { this._page = v.id; }}>
+            <ha-icon icon=${v.icon} style="--mdc-icon-size:20px"></ha-icon>
+            <span>${v.label}</span>
+          </button>
+        `)}
+      </div>
+    `;
+  }
+
+  /** Switches & relays, one card per owning device. A flat list bundles every
+   *  board's channels into one block once the wall switches (relay_a/b/c each)
+   *  are included, which reads as an undifferentiated dump. */
+  _renderRelaysView() {
+    // Relays and button/switch inputs together — they were two tabs showing
+    // overlapping sets, because _switchSectionEntities() returns both domains.
+    // The inclinometer's own toggle belongs on the Level tab, not here.
+    const relays = (this._switchSectionEntities() ?? [])
+      .filter(i => !/inclinometer/.test(i.eid));
+    // Group by owning device. A flat list bundles every board's channels into
+    // one column, which reads as a single undifferentiated block once the wall
+    // switches (relay_a/b/c each) are included.
+    const byDevice = new Map();
+    for (const r of relays) {
+      const devId = this.hass?.entities?.[r.eid]?.device_id;
+      const dev = devId ? this.hass?.devices?.[devId] : null;
+      const name = dev?.name_by_user ?? dev?.name ?? 'Other';
+      if (!byDevice.has(name)) byDevice.set(name, []);
+      byDevice.get(name).push(r);
+    }
+    const relayGroups = [...byDevice.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+
+    return html`
+      <div class="dev-page pw-page">
+        <div class="pw-grid">
+          ${relayGroups.map(([devName, group]) => html`
+          <section class="pw-card">
+            <h3 class="pw-h">${devName}
+              <span class="lp-count">${group.filter(r => r.state?.state === 'on').length} / ${group.length}</span>
+            </h3>
+              <div class="lp-list">
+                ${group.map(({ eid, domain, state, _slotName, _hidden }) => {
+                  const hidden = !!_hidden;
+                  const isOn = state?.state === 'on';
+                  const unavail = !state || state.state === 'unavailable' || state.state === 'unknown';
+                  const isRelay = domain === 'switch';
+                  const icon = isRelay
+                    ? (eid.includes('fan') ? 'mdi:fan' : 'mdi:power-plug')
+                    : (/_switch$/.test(eid) ? 'mdi:light-switch' : 'mdi:gesture-tap-button');
+                  // Relays read on/off; inputs read closed/open, matching what
+                  // the firmware's polarity-corrected entity actually means.
+                  const stateText = unavail ? 'Unavailable'
+                    : isRelay ? (isOn ? 'On' : 'Off')
+                    : (isOn ? 'Closed' : 'Open');
+                  return html`
+                    <div class="lp-row ${isOn ? 'on' : ''} ${unavail ? 'unavail' : ''} ${hidden ? 'hidden-item' : ''}"
+                         @click=${() => { if (!this._layoutMode && isRelay && !unavail) this.hass.callService('switch', 'toggle', {}, { entity_id: eid }); }}>
+                      <div class="lp-header">
+                        <ha-icon class="lp-icon" icon=${icon}
+                          style="--mdc-icon-size:24px; color:${unavail ? 'var(--sv-red)' : isOn ? 'var(--sv-accent)' : 'var(--sv-text-secondary)'}"></ha-icon>
+                        <div class="lp-info">
+                          <span class="lp-name">
+                            <span class="lp-name-text">${_slotName || this._label(eid)}</span>
+                            ${isRelay ? '' : html`<span class="lp-type">Input</span>`}
+                          </span>
+                          <span class="lp-bri">${stateText}</span>
+                        </div>
+                        ${isRelay ? html`
+                          <button class="lp-power" style="color:${isOn ? 'var(--sv-accent)' : 'var(--sv-text-disabled)'}"
+                            @click=${(e) => { e.stopPropagation(); if (!unavail) this.hass.callService('switch', 'toggle', {}, { entity_id: eid }); }}>
+                            <ha-icon icon="mdi:power" style="--mdc-icon-size:22px"></ha-icon>
+                          </button>
+                        ` : html`
+                          <span class="lp-input-dot" style="background:${isOn ? 'var(--sv-accent)' : 'var(--sv-bg-input)'}"></span>
+                        `}
+                        ${this._layoutMode ? html`
+                          <button class="sw-edit" title=${hidden ? 'Show this tile' : 'Hide this tile'}
+                            @click=${(e) => { e.stopPropagation(); this._toggleLayoutHidden('switch', eid); }}>
+                            <ha-icon icon=${hidden ? 'mdi:eye-off' : 'mdi:eye'} style="--mdc-icon-size:20px"></ha-icon>
+                          </button>
+                        ` : html`
+                          <button class="sw-edit" title="Rename / automations"
+                            @click=${(e) => { e.stopPropagation(); this._openEditModal(eid); }}>
+                            <ha-icon icon="mdi:pencil" style="--mdc-icon-size:20px"></ha-icon>
+                          </button>
+                        `}
+                      </div>
+                    </div>`;
+                })}
+              </div>
+          </section>
+          `)}
+          ${!relays.length ? html`
+            <section class="pw-card"><p class="sw-empty">No switches or inputs found.</p></section>
+          ` : ''}
+
+        </div>
+      </div>
+    `;
+  }
+
+
+
+
+
+
+
+  /** Comfort: heating, ventilation, levelling and environment readouts.
+   *  Climate and Level were separate tabs but are the same job — making the
+   *  van comfortable — and neither filled a tab on its own. */
+  _renderComfortView(entities, slots, level) {
+    const fanEids = [...new Set([
+      ...(slots?.fans ?? []).map((f) => f.entity ?? f).filter(Boolean),
+      ...Object.keys(this.hass?.states ?? {}).filter((e) => e.startsWith('fan.')),
+    ])].filter((e) => this.hass?.states?.[e]);
+
+    const readouts = (entities?.sensors ?? [])
+      .filter(({ eid }) => {
+        const dc = this.hass.states[eid]?.attributes?.device_class;
+        return (dc === 'temperature' || dc === 'humidity') && !/heater|truma/i.test(eid);
+      })
+      .slice(0, 8);
+
+    const incl = Object.keys(this.hass?.states ?? {})
+      .filter((eid) => /inclinometer/.test(eid) && this._isSmartvanioEntity(eid));
+    const inclToggle = incl.find((e) => e.startsWith('switch.'));
+    const inclButtons = incl.filter((e) => e.startsWith('button.'));
+    const tOn = inclToggle ? this.hass.states[inclToggle]?.state === 'on' : false;
+
+    return html`
+      <div class="dev-page cl-page">
+        <div class="cl-grid">
+          <section class="pw-card cl-heater">
+            <h3 class="pw-h">Heating</h3>
+            ${this._renderClimatePanel(entities, slots)}
+          </section>
+
+          <section class="pw-card">
+            <h3 class="pw-h">Levelling</h3>
+            ${this._renderLevelPanel(level)}
+            ${inclToggle ? html`
+              <div class="lp-list" style="margin-top:10px">
+                <div class="lp-row ${tOn ? 'on' : ''}"
+                     @click=${() => this.hass.callService('switch', 'toggle', {}, { entity_id: inclToggle })}>
+                  <div class="lp-header">
+                    <ha-icon class="lp-icon" icon="mdi:spirit-level"
+                      style="--mdc-icon-size:24px; color:${tOn ? 'var(--sv-accent)' : 'var(--sv-text-secondary)'}"></ha-icon>
+                    <div class="lp-info">
+                      <span class="lp-name"><span class="lp-name-text">${this._label(inclToggle)}</span></span>
+                      <span class="lp-bri">${tOn ? 'On' : 'Off'}</span>
+                    </div>
+                    <button class="lp-power" style="color:${tOn ? 'var(--sv-accent)' : 'var(--sv-text-disabled)'}"
+                      @click=${(e) => { e.stopPropagation(); this.hass.callService('switch', 'toggle', {}, { entity_id: inclToggle }); }}>
+                      <ha-icon icon="mdi:power" style="--mdc-icon-size:22px"></ha-icon>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ` : ''}
+            ${inclButtons.length ? html`
+              <div class="pw-btns" style="margin-top:10px">
+                ${inclButtons.map((b) => html`
+                  <button class="pw-btn"
+                    @click=${() => this.hass.callService('button', 'press', {}, { entity_id: b })}>
+                    ${this._label(b)}
+                  </button>
+                `)}
+              </div>
+            ` : ''}
+          </section>
+
+          <section class="pw-card">
+            <h3 class="pw-h">Ventilation
+              <span class="lp-count">${fanEids.filter((e) => this.hass.states[e]?.state === 'on').length} / ${fanEids.length}</span>
+            </h3>
+            ${fanEids.length ? html`
+              <div class="lp-list">
+                ${fanEids.map((eid) => {
+                  const st = this.hass.states[eid];
+                  const isOn = st?.state === 'on';
+                  const pct = st?.attributes?.percentage;
+                  return html`
+                    <div class="lp-row ${isOn ? 'on' : ''}"
+                         @click=${() => this.hass.callService('fan', 'toggle', {}, { entity_id: eid })}>
+                      <div class="lp-header">
+                        <ha-icon class="lp-icon" icon="mdi:fan"
+                          style="--mdc-icon-size:24px; color:${isOn ? 'var(--sv-accent)' : 'var(--sv-text-secondary)'}"></ha-icon>
+                        <div class="lp-info">
+                          <span class="lp-name"><span class="lp-name-text">${this._label(eid)}</span></span>
+                          <span class="lp-bri">${isOn ? (pct != null ? pct + '%' : 'On') : 'Off'}</span>
+                        </div>
+                        <button class="lp-power" style="color:${isOn ? 'var(--sv-accent)' : 'var(--sv-text-disabled)'}"
+                          @click=${(e) => { e.stopPropagation(); this.hass.callService('fan', 'toggle', {}, { entity_id: eid }); }}>
+                          <ha-icon icon="mdi:power" style="--mdc-icon-size:22px"></ha-icon>
+                        </button>
+                      </div>
+                    </div>`;
+                })}
+              </div>
+            ` : html`
+              <p class="sw-empty">No fans yet. A roof fan will appear here once it is added to Home Assistant.</p>
+            `}
+          </section>
+
+          ${readouts.length ? html`
+          <section class="pw-card">
+            <h3 class="pw-h">Temperatures</h3>
+            <div class="cl-readouts">
+              ${readouts.map(({ eid }) => {
+                const st = this.hass.states[eid];
+                const v = parseFloat(st?.state);
+                const unit = st?.attributes?.unit_of_measurement ?? '';
+                return html`
+                  <div class="cl-readout">
+                    <span class="cl-readout-label">${this._label(eid)}</span>
+                    <span class="cl-readout-val">${Number.isNaN(v) ? '—' : v.toFixed(1)}<i>${unit}</i></span>
+                  </div>`;
+              })}
+            </div>
+          </section>
+          ` : ''}
+        </div>
+      </div>
+    `;
+  }
+
+
+  /** Power. Mirrors the Lighting layout: a strip of headline stats up top
+   *  (where scenes sit on Lighting), then one full-width chart beneath. */
+  /** Every flow the van has, in one chart. Battery is stored in amps by the
+   *  SmartShunt, so it is multiplied by the battery voltage to reach watts —
+   *  putting amps and watts on one plot would need two y-scales, and a
+   *  dual-axis chart lets the units decide which line looks dominant.
+   *  Sign is the flow direction: in above zero, out below. */
+  _flowSeries(power) {
+    const has = (eid) => (eid && this.hass?.states?.[eid] ? eid : null);
+    const find = (re) => Object.keys(this.hass?.states ?? {}).find((e) => re.test(e)) ?? null;
+    return [
+      { key: 'batt',  label: 'Battery',  color: '#E2568F', sign: 1,
+        eid: has(power?.current), volts: has(power?.voltage) },
+      { key: 'solar', label: 'Solar',    color: '#B87C14', sign: 1,
+        eid: has(find(/^sensor\.solar_charger_solar_power$/)) || has(find(/pv_power$/)) },
+      { key: 'shore', label: 'Shore',    color: '#4E93E4', sign: 1,
+        eid: has(find(/^sensor\.inverter_ac_in_power$/)) },
+      { key: 'load',  label: 'Inverter', color: '#10A472', sign: -1,
+        eid: has(find(/^sensor\.inverter_ac_out_power$/)) },
+    ].filter((d) => d.eid);
+  }
+
+  /** The DC-DC charger (Victron Orion-Tr over BLE) advertises input voltage,
+   *  output voltage and charge state — but no current and no power, so there
+   *  is no honest way to draw it as a watts line. Its contribution is already
+   *  inside the battery line; what the chart can add is *when* it was running,
+   *  drawn as a band behind the series. */
+  _dcdcStateEid() {
+    const st = this.hass?.states ?? {};
+    return Object.keys(st).find((e) => /^sensor\.dcdc.*charge_state$/.test(e))
+        ?? Object.keys(st).find((e) => /^sensor\..*dcdc.*(charge_)?state$/.test(e))
+        ?? null;
+  }
+
+  /** One websocket call for every series, battery voltage included. */
+  async _loadFlowHistory(series, hours) {
+    if (!series.length || this._flowLoading) return;
+    this._flowLoading = true;
+    const key = series.map((d) => d.eid).join('|');
+    try {
+      const end = new Date();
+      const start = new Date(end.getTime() - hours * 3600 * 1000);
+      const voltEid = series.find((d) => d.key === 'batt')?.volts ?? null;
+      const dcdcEid = this._dcdcStateEid();
+      const ids = [...new Set([
+        ...series.map((d) => d.eid),
+        ...(voltEid ? [voltEid] : []),
+        ...(dcdcEid ? [dcdcEid] : []),
+      ])];
+      const res = await this.hass.callWS({
+        type: 'history/history_during_period',
+        start_time: start.toISOString(),
+        end_time: end.toISOString(),
+        entity_ids: ids,
+        minimal_response: true,
+        no_attributes: true,
+      });
+
+      const readPts = (eid) => {
+        const out = [];
+        for (const row of res?.[eid] ?? []) {
+          const v = parseFloat(row.s ?? row.state);
+          const ms = row.lu ? row.lu * 1000
+                            : Date.parse(row.last_updated ?? row.last_changed ?? '');
+          if (!Number.isNaN(v) && ms) out.push([ms, v]);
+        }
+        out.sort((a, b) => a[0] - b[0]);
+        return out;
+      };
+
+      // Battery amps → watts. Voltage is sampled far less often than current,
+      // so it is forward-filled onto the current series rather than joined.
+      const volts = voltEid ? readPts(voltEid) : [];
+      const NOMINAL_V = 12.8;   // only used before the first voltage sample lands
+      const toWatts = (pts) => {
+        let i = 0, v = volts.length ? volts[0][1] : NOMINAL_V;
+        return pts.map(([ms, a]) => {
+          while (i < volts.length && volts[i][0] <= ms) { v = volts[i][1]; i++; }
+          return [ms, a * v];
+        });
+      };
+
+      // Bucket-average to a fixed budget: the chart is ~1000px wide, so more
+      // samples than that buy path length and hit-testing, not detail.
+      const BUDGET = 300;
+      const reduce = (pts) => {
+        if (pts.length <= BUDGET) return pts;
+        const t0 = pts[0][0];
+        const span = Math.max(1, pts[pts.length - 1][0] - t0);
+        const bk = new Array(BUDGET);
+        for (const [ms, v] of pts) {
+          const b = Math.min(BUDGET - 1, Math.floor(((ms - t0) / span) * BUDGET));
+          if (bk[b]) { bk[b][1] += v; bk[b][2] += 1; bk[b][0] = ms; }
+          else bk[b] = [ms, v, 1];
+        }
+        return bk.filter(Boolean).map((b) => [b[0], b[1] / b[2]]);
+      };
+
+      // Runs of "actually delivering" charge state → [start, end] spans.
+      const DCDC_ON = new Set(['bulk', 'absorption', 'float', 'storage', 'power_supply',
+                               'equalize_manual', 'repeated_absorption', 'recondition']);
+      const bands = [];
+      if (dcdcEid) {
+        let open = null;
+        const rows = (res?.[dcdcEid] ?? []).map((row) => [
+          row.lu ? row.lu * 1000 : Date.parse(row.last_updated ?? row.last_changed ?? ''),
+          String(row.s ?? row.state ?? '').toLowerCase(),
+        ]).filter(([ms]) => ms).sort((a, b) => a[0] - b[0]);
+        for (const [ms, st] of rows) {
+          const on = DCDC_ON.has(st);
+          if (on && open == null) open = ms;
+          else if (!on && open != null) { bands.push([open, ms]); open = null; }
+        }
+        if (open != null) bands.push([open, end.getTime()]);
+      }
+
+      const out = [];
+      for (const d of series) {
+        let pts = readPts(d.eid);
+        if (d.key === 'batt') pts = toWatts(pts);
+        if (d.sign < 0) pts = pts.map(([ms, v]) => [ms, -Math.abs(v)]);
+        out.push({ ...d, pts: reduce(pts) });
+      }
+      this._flowHistory = { hours, key, series: out, bands, dcdc: !!dcdcEid };
+    } catch (err) {
+      console.warn('[smartvanio] flow history failed', err);
+      this._flowHistory = { hours, key, series: [], bands: [], dcdc: false, error: true,
+                            errMsg: String(err?.message || err) };
+    } finally {
+      this._flowLoading = false;
+    }
+  }
+
+  /** Host element only — the canvas itself is drawn in _syncFlowPlot(). */
+  _renderFlowChart(power) {
+    const series = this._flowSeries(power);
+    if (!series.length) return html`<p class="sw-empty">No power sensors found.</p>`;
+    const key = series.map((d) => d.eid).join('|');
+    const h = this._flowHistory;
+    if (!h || h.key !== key || h.hours !== this._pwrHours) {
+      this._loadFlowHistory(series, this._pwrHours);
+      return html`<p class="sw-empty">Loading…</p>`;
+    }
+    if (h.error) return html`<p class="sw-empty">History unavailable — ${h.errMsg}</p>`;
+    const drawn = (h.series ?? []).filter((d) => d.pts.length > 1);
+    if (!drawn.length) return html`<p class="sw-empty">Not enough history yet.</p>`;
+
+    return html`
+      <div class="uplot-host" id="flowplot"></div>
+      <div class="pc-foot">
+        ${h.dcdc ? html`
+          <span class="pc-band-key" title="The DC-DC charger reports no current or power, so its
+output cannot be plotted. Its contribution is already part of the battery line.">
+            <i class="pc-band-swatch"></i>DC-DC charging
+          </span>` : ''}
+        <div class="pc-ranges pc-ranges-below">
+        ${[6, 24, 72].map((hr) => html`
+          <button class="pc-range ${this._pwrHours === hr ? 'active' : ''}"
+            @click=${() => { this._pwrHours = hr; this._flowHistory = null; }}>${hr}h</button>
+          `)}
+        </div>
+      </div>
+    `;
+  }
+
+  /** What each series reads right now, derived the same way as its plotted
+   *  history — battery in watts, loads negative — so the idle legend and the
+   *  hovered legend are the same quantity. */
+  _liveFlowValues(drawn) {
+    const st = this.hass?.states ?? {};
+    const num = (eid) => {
+      const v = parseFloat(st[eid]?.state);
+      return Number.isNaN(v) ? null : v;
+    };
+    return drawn.map((d) => {
+      if (d.key === 'batt') {
+        const amps = num(d.eid);
+        if (amps == null) return null;
+        const volts = d.volts ? num(d.volts) : null;
+        return amps * (volts ?? 12.8);
+      }
+      const w = num(d.eid);
+      if (w == null) return null;
+      return d.sign < 0 ? -Math.abs(w) : w;
+    });
+  }
+
+  /** uPlot blanks its live legend to "--" when the pointer leaves the plot.
+   *  Off-cursor the useful reading is the present one, so the value cells are
+   *  overwritten in place — cheaper than re-rendering the card on every move. */
+  _applyIdleLegend(u, drawn) {
+    if (!u || u.cursor?.idx != null) return;
+    const rows = u.root?.querySelectorAll('.u-legend .u-series');
+    if (!rows?.length) return;
+    const vals = this._liveFlowValues(drawn);
+    const timeCell = rows[0]?.querySelector('.u-value');
+    if (timeCell) timeCell.textContent = 'now';
+    drawn.forEach((d, i) => {
+      const cell = rows[i + 1]?.querySelector('.u-value');
+      if (!cell) return;
+      const v = vals[i];
+      cell.textContent = v == null ? '—' : `${Math.round(v)}W`;
+    });
+  }
+
+  /** Create or refresh the uPlot instance. Canvas, so no SVG namespace to get
+   *  wrong; called from updated() because the host must exist first. */
+  _syncFlowPlot() {
+    const host = this.renderRoot?.querySelector('#flowplot');
+    if (!host) {
+      if (this._flowPlot) {
+        this._flowPlot.destroy();
+        this._flowPlot = null;
+        this._flowPlotSig = null;
+        this._flowDataRef = null;
+      }
+      return;
+    }
+    const drawn = (this._flowHistory?.series ?? []).filter((d) => d.pts.length > 1);
+    if (!drawn.length) return;
+
+    if (this._flowRO?.target !== host) {
+      this._flowRO?.obs.disconnect();
+      const obs = new ResizeObserver(() => {
+        cancelAnimationFrame(this._flowRAF);
+        this._flowRAF = requestAnimationFrame(() => {
+          try { this._syncFlowPlot(); } catch { /* transient during teardown */ }
+        });
+      });
+      obs.observe(host);
+      this._flowRO = { target: host, obs };
+    }
+
+    const cs = getComputedStyle(this);
+    const tok = (n, fb) => (cs.getPropertyValue(n) || '').trim() || fb;
+    const ink  = tok('--sv-text-disabled', '#55556A');
+    const grid = tok('--sv-border-subtle', '#1E1E2A');
+    const zero = tok('--sv-text-secondary', '#9A9AB0');
+    const DCDC_BAND_FILL = tok('--sv-band-dcdc', 'rgba(139, 123, 216, 0.16)');
+
+    const bandSig = (this._flowHistory?.bands ?? []).flat().join(',');
+    const width  = Math.max(240, host.clientWidth || host.getBoundingClientRect().width || 640);
+    const height = Math.max(180, Math.min(420, host.clientHeight || 260));
+    const sig = `${drawn.map((d) => d.key).join(',')}|${width}|${height}|${bandSig}`;
+
+    // updated() fires on every hass state push. When only the live readings
+    // moved, refresh the legend and skip the data rebuild and the repaint.
+    if (this._flowPlot && this._flowPlotSig === sig && this._flowDataRef === this._flowHistory) {
+      this._applyIdleLegend(this._flowPlot, drawn);
+      return;
+    }
+
+    // One shared x-axis: the union of every series' timestamps, each series
+    // forward-filled onto it, since the sources report at different rates.
+    const xs = [...new Set(drawn.flatMap((d) => d.pts.map((pt) => pt[0])))].sort((a, b) => a - b);
+    const data = [xs.map((ms) => ms / 1000)];
+    for (const d of drawn) {
+      let i = 0, last = null;
+      const col = [];
+      for (const t of xs) {
+        while (i < d.pts.length && d.pts[i][0] <= t) { last = d.pts[i][1]; i++; }
+        col.push(last);
+      }
+      data.push(col);
+    }
+
+    if (this._flowPlot && this._flowPlotSig === sig) {
+      this._flowPlot.setData(data);
+      this._flowDataRef = this._flowHistory;
+      this._applyIdleLegend(this._flowPlot, drawn);
+      return;
+    }
+    if (this._flowPlot) { this._flowPlot.destroy(); this._flowPlot = null; }
+
+    // Backdrop, drawn in drawClear so it sits under the axes and series:
+    //   · DC-DC activity bands (no watts available — see _dcdcStateEid)
+    //   · the y=0 rule, which with loads drawn negative separates in from out
+    const bands = this._flowHistory?.bands ?? [];
+    const backdrop = {
+      hooks: {
+        drawClear: [(u) => {
+          const ctx = u.ctx;
+          const { left, top, width, height } = u.bbox;
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(left, top, width, height);
+          ctx.clip();
+
+          for (const [b0, b1] of bands) {
+            const x0 = u.valToPos(b0 / 1000, 'x', true);
+            const x1 = u.valToPos(b1 / 1000, 'x', true);
+            if (!Number.isFinite(x0) || !Number.isFinite(x1)) continue;
+            const a = Math.max(left, Math.min(x0, x1));
+            const b = Math.min(left + width, Math.max(x0, x1));
+            if (b - a < 0.5) continue;
+            ctx.fillStyle = DCDC_BAND_FILL;
+            ctx.fillRect(a, top, b - a, height);
+          }
+
+          const yv = u.valToPos(0, 'y', true);
+          if (Number.isFinite(yv)) {
+            ctx.strokeStyle = zero;
+            ctx.globalAlpha = 0.5;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(left, yv);
+            ctx.lineTo(left + width, yv);
+            ctx.stroke();
+          }
+          ctx.restore();
+        }],
+      },
+    };
+
+    const idleLegend = {
+      hooks: {
+        ready:     [(u) => this._applyIdleLegend(u, drawn)],
+        setLegend: [(u) => this._applyIdleLegend(u, drawn)],
+      },
+    };
+
+    this._flowPlot = new uPlot({
+      width, height,
+      padding: [10, 12, 0, 0],
+      legend: { show: true, live: true },
+      cursor: { y: false, points: { size: 7 } },
+      scales: { x: { time: true } },
+      plugins: [backdrop, idleLegend],
+      axes: [
+        { stroke: ink, grid: { stroke: grid, width: 1 }, ticks: { stroke: grid, width: 1 },
+          size: 28, font: '11px system-ui' },
+        { stroke: ink, grid: { stroke: grid, width: 1 }, ticks: { stroke: grid, width: 1 },
+          size: 48, font: '11px system-ui',
+          values: (u, vals) => vals.map((v) => `${Math.round(v)}W`) },
+      ],
+      series: [
+        { value: (u, v) => (v == null ? '--' : new Date(v * 1000).toLocaleTimeString(
+            [], { hour: '2-digit', minute: '2-digit' })) },
+        ...drawn.map((d) => ({
+          label: d.label,
+          stroke: d.color,
+          width: 2,
+          points: { show: false },
+          spanGaps: true,
+          value: (u, v) => (v == null ? '--' : `${Math.round(v)}W`),
+        })),
+      ],
+    }, data, host);
+    this._flowPlotSig = sig;
+    this._flowDataRef = this._flowHistory;
+  }
+
+  _renderPowerView(entities, slots) {
+    const power = slots?.power;
+    const read = (eid) => {
+      const v = eid ? parseFloat(this.hass.states[eid]?.state) : NaN;
+      return Number.isNaN(v) ? null : v;
+    };
+    const unitOf = (eid) => this.hass.states[eid]?.attributes?.unit_of_measurement ?? '';
+
+    const soc = power ? read(power.soc) : null;
+    const amps = power ? read(power.current) : null;
+    const left = power ? this._formatTimeLeft(power.time_left) : null;
+    const solarEid = slots?.solar
+      ?? (entities?.sensors ?? []).find(({ eid }) => /solar.*power|pv_power/i.test(eid))?.eid;
+    const solar = solarEid ? read(solarEid) : null;
+
+    const socColor = soc == null ? 'var(--sv-text-disabled)'
+      : soc > 50 ? 'var(--sv-green)' : soc > 20 ? 'var(--sv-amber)' : 'var(--sv-red)';
+    const ampColor = amps == null ? 'var(--sv-text-disabled)'
+      : amps > 0 ? 'var(--sv-green)' : 'var(--sv-text-primary)';
+
+    const stat = (label, value, unit, color, icon) => html`
+      <div class="ps-card">
+        <div class="ps-top">
+          <ha-icon icon=${icon} style="--mdc-icon-size:16px; color:${color}"></ha-icon>
+          <span class="ps-label">${label}</span>
+        </div>
+        <span class="ps-value" style="color:${color}">
+          ${value == null ? '—' : value}${unit ? html`<i>${unit}</i>` : ''}
+        </span>
+      </div>
+    `;
+
+    return html`
+      <div class="dev-page ps-page">
+        <div class="ps-strip">
+          ${stat('Battery', soc == null ? null : Math.round(soc), '%', socColor, 'mdi:battery')}
+          ${stat('Remaining', left, '', 'var(--sv-text-primary)', 'mdi:clock-outline')}
+          ${stat('Solar in', solar == null ? null : Math.round(solar),
+                 solarEid ? unitOf(solarEid) : 'W',
+                 solar > 0 ? 'var(--sv-amber)' : 'var(--sv-text-disabled)', 'mdi:solar-power')}
+          ${stat('Current', amps == null ? null : amps.toFixed(1),
+                 power?.current ? unitOf(power.current) : 'A', ampColor, 'mdi:flash')}
+        </div>
+
+        ${power?.current ? html`
+          <section class="pw-card ps-chart">
+            <h3 class="pw-h">
+              Power flow — last ${this._pwrHours}h
+              <small>watts · above zero in, below zero out</small>
+            </h3>
+            ${this._renderFlowChart(power)}
+          </section>
+        ` : html`
+          <section class="pw-card">
+            <p class="sw-empty">No battery current sensor configured. Add one in Settings &rarr; Power.</p>
+          </section>
+        `}
+      </div>
+    `;
+  }
+
+  /** True if this sensor has a firmware calibration-points entity behind it. */
+  _isCalibratable(eid) {
+    if (!eid || !eid.startsWith('sensor.')) return false;
+    const prefix = eid.match(/_(sensor_\d+)_/)?.[1];
+    if (!prefix) return false;
+    return !!this._findCompanionOnDevice('text', eid, prefix + '_interpolation_points');
+  }
+
+  /** Find a sibling entity on the same device whose entity_id ends with
+   *  `_${suffix}`. Matching on device_id + object_id suffix survives both
+   *  device renames and the absence of unique_id in hass.entities (the frontend
+   *  registry *display* map doesn't include it, so unique_id lookups find
+   *  nothing at all). */
+  _findCompanionOnDevice(domain, eid, suffix) {
+    const devId = this.hass?.entities?.[eid]?.device_id;
+    if (!devId) return null;
+    const tail = '_' + suffix;
+    return Object.keys(this.hass.entities).find(
+      (e) => e.startsWith(domain + '.') &&
+             this.hass.entities[e]?.device_id === devId &&
+             e.endsWith(tail),
+    ) ?? null;
+  }
+
+  /** Current mode ("Sensor" / "Switch (NO)" / "Switch (NC)") for a resistive
+   *  input entity, read from the firmware's companion select. null if none. */
+  _inputModeFor(eid) {
+    const prefix = eid.match(/_(sensor_\d+)_/)?.[1];
+    if (!prefix) return null;
+    const selEid = this._findCompanionOnDevice('select', eid, prefix + '_mode');
+    return selEid ? (this.hass.states[selEid]?.state ?? null) : null;
+  }
+
+  /** Battery time-remaining, formatted from the entity's declared unit.
+   *  Victron/SmartShunt reports MINUTES, which was previously rendered with an
+   *  "h" suffix — 8122 minutes showed as "8122h" instead of "5d 15h". Read the
+   *  unit so an hours-based sensor on another van still works. */
+  _formatTimeLeft(eid) {
+    const st = eid ? this.hass?.states?.[eid] : null;
+    const v = parseFloat(st?.state);
+    if (!st || Number.isNaN(v)) return null;
+    const unit = String(st.attributes?.unit_of_measurement ?? '').toLowerCase();
+    let mins;
+    if (unit.startsWith('s')) mins = v / 60;
+    else if (unit.startsWith('h')) mins = v * 60;
+    else if (unit.startsWith('d')) mins = v * 1440;
+    else mins = v;                       // min / minutes / unset
+    if (!Number.isFinite(mins) || mins < 0) return null;
+    if (mins < 60) return `${Math.round(mins)}m`;
+    const h = Math.floor(mins / 60);
+    if (h < 24) return `${h}h ${Math.round(mins % 60)}m`;
+    return `${Math.floor(h / 24)}d ${h % 24}h`;
+  }
+
+  /** True if the entity belongs to a SmartVan.io device. */
+  _isSmartvanioEntity(eid) {
+    const devId = this.hass?.entities?.[eid]?.device_id;
+    const dev = devId ? this.hass?.devices?.[devId] : null;
+    return !!dev?.identifiers?.some(([dom]) => dom === "smartvanio");
+  }
+
+  /** SmartVan.io relays + button/switch inputs, for the Switches section.
+   *  binary_sensors are included because they otherwise have no tile anywhere,
+   *  which meant automations for them had to be reached via a light's modal. */
+  _switchSectionEntities() {
+    const slots = this._resolveSlots() ?? {};
+    const nameFor = (eid) => {
+      const inSwitches = (slots.switches ?? []).find((x) => (x.entity ?? x.eid) === eid);
+      const inButtons  = (slots.buttons  ?? []).find((x) => (x.entity ?? x.eid) === eid);
+      return inSwitches?.name || inButtons?.name || null;
+    };
+    const out = [];
+    for (const eid of Object.keys(this.hass?.states ?? {})) {
+      const domain = eid.split(".")[0];
+      if (domain !== "switch" && domain !== "binary_sensor") continue;
+      if (!this._isSmartvanioEntity(eid)) continue;
+      // Resistive inputs publish both _input_open and _switch. Show whichever
+      // matches the input's mode: _switch is always false in Sensor mode, and
+      // _input_open is just the uncorrected version of _switch otherwise.
+      const pair = eid.match(/_(sensor_\d+)_(input_open|switch)$/);
+      if (pair) {
+        const isSwitchMode = (this._inputModeFor(eid) ?? "Sensor") !== "Sensor";
+        if (pair[2] === "switch" && !isSwitchMode) continue;
+        if (pair[2] === "input_open" && isSwitchMode) continue;
+      }
+      // Hidden entries stay out of the normal view but remain visible (dimmed)
+      // in layout mode, which is the only place they can be brought back.
+      const hidden = this._layoutMode
+        ? !!this._layoutHiddenSwitches?.has(eid)
+        : new Set(slots.hiddenSwitches ?? []).has(eid);
+      if (hidden && !this._layoutMode) continue;
+      out.push({
+        eid,
+        domain,
+        state: this.hass.states[eid],
+        _slotName: nameFor(eid),
+        _hidden: hidden,
+      });
+    }
+    return out.sort((a, b) =>
+      this._label(a.eid, a._slotName).localeCompare(this._label(b.eid, b._slotName)));
+  }
+
 
   _openAddLightModal() {
     this._lightModal = { item: { entity: '', name: '' }, isNew: true };
@@ -3676,10 +5115,16 @@ class VanCtlHmiCard extends LitElement {
     const isOn = this.hass.states[eid]?.state === 'on';
     if (isOn) {
       this.hass.callService('light', 'turn_off', { entity_id: eid });
-    } else {
-      // The integration handles re-applying the effect on turn_on
-      this.hass.callService('light', 'turn_on', { entity_id: eid });
+      return;
     }
+    // A plain turn_on leaves the colour to the firmware's restore, which on a
+    // never-coloured strip is flat white. Send the configured colour unless
+    // this light is set to keep its last one — but not when a pattern is
+    // active, since that owns the pixels.
+    const data = { entity_id: eid };
+    const rgb = this._getActivePatternName(eid) ? null : this._onColorFor(eid);
+    if (rgb) { data.rgb_color = rgb; data.effect = 'None'; }
+    this.hass.callService('light', 'turn_on', data);
   }
 
   _getActivePatternName(eid) {
@@ -3814,6 +5259,10 @@ class VanCtlHmiCard extends LitElement {
     const eid = this._editingEntity;
     const snap = this._modalOpenState;
     const info = this._resolveSegmentTopic();
+
+    // Calibration is applied live while editing, so Cancel has to undo it.
+    // Independent of the light-preview restore below.
+    this._revertCalibration();
 
     // If save already updated the snapshot, nothing to revert
     if (!snap) {
@@ -3985,12 +5434,6 @@ class VanCtlHmiCard extends LitElement {
       <div class="rp-swiper swiper">
         <div class="swiper-wrapper">
           <div class="swiper-slide">
-            <div class="rp-page">${this._renderClimatePanel(entities, slots)}</div>
-          </div>
-          <div class="swiper-slide">
-            <div class="rp-page">${this._renderLevelPanel(level)}</div>
-          </div>
-          <div class="swiper-slide">
             <div class="rp-page">${this._renderOverviewPanel(entities, slots)}</div>
           </div>
         </div>
@@ -4094,12 +5537,13 @@ class VanCtlHmiCard extends LitElement {
             const cfg = await this.hass.callApi("GET", `config/automation/config/${configKey}`);
             const meta = JSON.parse(cfg.description ?? "{}");
             if (!meta.smartvanio) continue;
-            if (meta.entity_id === entity_id || meta.target_entity_id === entity_id) {
+            const metaTargets = this._targetList(meta.target_entity_id);
+            if (meta.entity_id === entity_id || metaTargets.includes(entity_id)) {
               rows.push({
                 id: configKey,
                 source_entity_id: meta.entity_id ?? "",
                 gesture: meta.gesture ?? meta.event ?? "",
-                target_entity_id: meta.target_entity_id ?? "",
+                target_entity_id: metaTargets.length > 1 ? metaTargets : (metaTargets[0] ?? ""),
                 action: meta.action ?? "",
                 duration: meta.duration ?? "",
                 brightness_pct: meta.brightness_pct ?? "",
@@ -4309,9 +5753,23 @@ class VanCtlHmiCard extends LitElement {
               <div class="ft-sw ${isOn ? 'on' : ''} ${unavail ? 'unavail' : ''} ${this._setupMode ? 'setup' : ''} ${icon && !this._setupMode ? 'icon-only' : ''}"
                    style="${color ? `--ft-sw-color:${color}` : ''}"
                    title="${name}${unavail && !this._setupMode ? ' (offline)' : ''}"
-                   @click=${() => this._setupMode
-                     ? this._openEditFooterModal('footerSwitches', idx)
-                     : (!unavail && this._toggleSwitch(eid))}>
+                   @click=${() => {
+                     if (this._swLp) { this._swLp = false; return; }
+                     this._setupMode
+                       ? this._openEditFooterModal('footerSwitches', idx)
+                       : (!unavail && this._toggleSwitch(eid));
+                   }}
+                   @pointerdown=${() => {
+                     if (this._setupMode) return;
+                     this._swLp = false;
+                     this._ftSwTimer = setTimeout(() => {
+                       this._ftSwTimer = null;
+                       this._swLp = true;
+                       this._openEditModal(eid);
+                     }, 500);
+                   }}
+                   @pointerup=${() => { if (this._ftSwTimer) { clearTimeout(this._ftSwTimer); this._ftSwTimer = null; } }}
+                   @pointerleave=${() => { if (this._ftSwTimer) { clearTimeout(this._ftSwTimer); this._ftSwTimer = null; } }}>
                 ${this._setupMode
                   ? html`<ha-icon icon="mdi:pencil" style="--mdc-icon-size:14px"></ha-icon><span>${name}</span>`
                   : icon
@@ -4524,6 +5982,16 @@ class VanCtlHmiCard extends LitElement {
                   ></smartvanio-icon-picker>
                 </div>
               </div>
+              ${this._isCalibratable(m.item.entity) ? html`
+                <div class="fm-field">
+                  <label class="fm-label">Calibration</label>
+                  <button class="pw-btn" style="width:100%"
+                    @click=${() => { const eid = m.item.entity; this._footerModal = null; this._openEditModal(eid); }}>
+                    <ha-icon icon="mdi:tune-variant" style="--mdc-icon-size:18px"></ha-icon>
+                    Calibrate this sensor…
+                  </button>
+                </div>
+              ` : ''}
             ` : html`
               <div class="fm-field">
                 <label class="fm-label">Entity</label>
@@ -4592,6 +6060,7 @@ class VanCtlHmiCard extends LitElement {
     this._layoutHiddenScenes = new Set(slots.hiddenScenes ?? []);
     this._layoutLightOrder = [...(slots.lightOrder ?? [])];
     this._layoutHiddenLights = new Set(slots.hiddenLights ?? []);
+    this._layoutHiddenSwitches = new Set(slots.hiddenSwitches ?? []);
     this._layoutMode = true;
     this._layoutDrag = null;
   }
@@ -4607,6 +6076,7 @@ class VanCtlHmiCard extends LitElement {
     slots.hiddenScenes = [...this._layoutHiddenScenes];
     slots.lightOrder = this._layoutLightOrder;
     slots.hiddenLights = [...this._layoutHiddenLights];
+    slots.hiddenSwitches = [...(this._layoutHiddenSwitches ?? [])];
     this._cardConfig = { ...this._cardConfig, slots };
     this._saveMqttConfig();
     this._layoutMode = false;
@@ -4614,7 +6084,9 @@ class VanCtlHmiCard extends LitElement {
   }
 
   _toggleLayoutHidden(type, id) {
-    const set = type === 'scene' ? this._layoutHiddenScenes : this._layoutHiddenLights;
+    const set = type === 'scene' ? this._layoutHiddenScenes
+      : type === 'switch' ? this._layoutHiddenSwitches
+      : this._layoutHiddenLights;
     if (set.has(id)) set.delete(id);
     else set.add(id);
     this.requestUpdate();
@@ -4741,10 +6213,59 @@ class VanCtlHmiCard extends LitElement {
     this._layoutDrag = null;
   }
 
+  /** Confirmation policy for a footer switch: 'off' | 'on' | 'always' | undefined. */
+  _confirmModeFor(eid) {
+    const slots = this._resolveSlots() ?? {};
+    return (slots.footerSwitches ?? []).find((sw) => sw.entity === eid)?.confirm;
+  }
+
   _toggleSwitch(eid) {
+    const isOn = this.hass.states[eid]?.state === 'on';
+    const turningOn = !isOn;
+    const mode = this._confirmModeFor(eid);
+    // Some loads can't be recovered remotely — turning Starlink off means no
+    // way back until someone is physically at the van.
+    const needs = mode === 'always'
+      || (mode === 'off' && !turningOn)
+      || (mode === 'on' && turningOn);
+    if (needs) {
+      const slots = this._resolveSlots() ?? {};
+      const name = (slots.footerSwitches ?? []).find((sw) => sw.entity === eid)?.name
+        || this._label(eid);
+      this._confirmAction = { eid, name, turningOn };
+      return;
+    }
+    this._doToggle(eid);
+  }
+
+  _doToggle(eid) {
     const domain = eid.split('.')[0];
     const isOn = this.hass.states[eid]?.state === 'on';
     this.hass.callService(domain, isOn ? 'turn_off' : 'turn_on', { entity_id: eid });
+  }
+
+  _renderConfirmModal() {
+    const c = this._confirmAction;
+    if (!c) return '';
+    return html`
+      <div class="cf-backdrop" @click=${(e) => { if (e.target === e.currentTarget) this._confirmAction = null; }}>
+        <div class="cf-box" role="alertdialog" aria-modal="true">
+          <h3 class="cf-title">${c.turningOn ? 'Turn on' : 'Turn off'} ${c.name}?</h3>
+          <p class="cf-body">
+            ${c.turningOn
+              ? html`This will switch <b>${c.name}</b> on.`
+              : html`This will switch <b>${c.name}</b> off. If it is your only link to the van, you will not be able to switch it back on remotely.`}
+          </p>
+          <div class="cf-actions">
+            <button class="cf-btn" @click=${() => { this._confirmAction = null; }}>Cancel</button>
+            <button class="cf-btn cf-primary ${c.turningOn ? '' : 'cf-danger'}"
+              @click=${() => { const eid = c.eid; this._confirmAction = null; this._doToggle(eid); }}>
+              ${c.turningOn ? 'Turn on' : 'Turn off'}
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
   }
 
   _toggleTheme() {
@@ -5496,6 +7017,13 @@ class VanCtlHmiCard extends LitElement {
 
     return html`
       <div class="dev-page">
+        <div class="dev-page-header">
+          <button class="dev-back" @click=${() => { this._page = 'lighting'; }}>
+            <ha-icon icon="mdi:arrow-left"></ha-icon>
+            <span>Overview</span>
+          </button>
+          <span class="dev-page-title">Devices</span>
+        </div>
         <div class="dev-grid">
           ${haDevices.map((dev) => {
             const svId = dev.identifiers?.find(([d]) => d === "smartvanio")?.[1];
@@ -5712,7 +7240,7 @@ class VanCtlHmiCard extends LitElement {
               </div>
               <div class="ov-power-rows">
                 ${currentVal !== null ? html`<div class="ov-power-row"><span class="ov-power-label">Draw</span><span class="ov-power-val">${currentVal.toFixed(1)}A</span></div>` : ''}
-                ${timeLeft !== null ? html`<div class="ov-power-row"><span class="ov-power-label">Left</span><span class="ov-power-val">${timeLeft.toFixed(0)}h</span></div>` : ''}
+                ${this._formatTimeLeft(power?.time_left) ? html`<div class="ov-power-row"><span class="ov-power-label">Left</span><span class="ov-power-val">${this._formatTimeLeft(power.time_left)}</span></div>` : ''}
                 ${battV !== null ? html`<div class="ov-power-row"><span class="ov-power-label">Volts</span><span class="ov-power-val">${battV.toFixed(1)}V</span></div>` : ''}
               </div>
             </div>
@@ -6132,6 +7660,12 @@ class VanCtlHmiCard extends LitElement {
             </button>
 
             <div class="nd-section-label">Navigate</div>
+            <button class="nd-row" @click=${() => { this._page = 'relays'; this._closeNavDrawer(); }}>
+              <ha-icon class="nd-row-icon" icon="mdi:toggle-switch-outline" style="--mdc-icon-size:22px"></ha-icon>
+              <span class="nd-row-label">Switches</span>
+              <ha-icon class="nd-row-chevron" icon="mdi:chevron-right"></ha-icon>
+            </button>
+
             <button class="nd-row" @click=${() => { this._page = 'devices'; this._closeNavDrawer(); }}>
               <ha-icon class="nd-row-icon" icon="mdi:chip" style="--mdc-icon-size:22px"></ha-icon>
               <span class="nd-row-label">Devices</span>
@@ -6157,21 +7691,22 @@ class VanCtlHmiCard extends LitElement {
 
   // ── Climate panel edge tab ─────────────────────────────────────
 
-  _renderClimateTab() {
-    // Hide on non-dashboard pages and while in setup/layout modes
-    if (this._page !== 'dashboard') return '';
+  /** Collapse handle for the summary panel. Climate and Level used to live in
+   *  that panel and now have their own tabs, so this only toggles Overview. */
+  _renderOverviewTab() {
+    if (this._page !== 'lighting') return '';
     if (this._setupMode || this._layoutMode) return '';
 
     const open = !!this._showRightPanel;
     return html`
       <button class="ct-tab ${open ? 'open' : ''}"
               @click=${() => this._toggleRightPanel()}
-              aria-label="${open ? 'Hide climate panel' : 'Show climate panel'}"
-              title="${open ? 'Hide climate panel' : 'Show climate panel'}">
+              aria-label="${open ? 'Hide summary panel' : 'Show summary panel'}"
+              title="${open ? 'Hide summary panel' : 'Show summary panel'}">
         <ha-icon class="ct-tab-chev"
                  icon="${open ? 'mdi:chevron-right' : 'mdi:chevron-left'}"
                  style="--mdc-icon-size:22px"></ha-icon>
-        <span class="ct-tab-label">Climate</span>
+        <span class="ct-tab-label">Overview</span>
       </button>
     `;
   }
@@ -6592,7 +8127,8 @@ class VanCtlHmiCard extends LitElement {
       return [...slotMapped, ...discovered.filter((e) => !slotIds.has(e.eid))];
     };
 
-    const lights = mergeEntities(slots?.lights, safeEntities.lights);
+    const lights = mergeEntities(slots?.lights, safeEntities.lights)
+      .filter((l) => l.eid?.startsWith('light.'));
     const powerSwitches = mergeEntities(
       slots?.switches,
       this._powerSwitches(safeEntities.switches),
@@ -6620,7 +8156,7 @@ class VanCtlHmiCard extends LitElement {
       <div class="hmi">
         <!-- Top bar -->
         <div class="top-bar">
-          <span class="tb-greeting">${greeting} <span style="font-size:10px;opacity:0.4;font-weight:400">v159</span></span>
+          <span class="tb-greeting">${greeting} <span style="font-size:10px;opacity:0.4;font-weight:400">v209</span></span>
           <div class="tb-stats">
             ${topbarStats.length ? topbarStats.map(({entity, name, icon}, i) => {
               const st = this.hass.states[entity];
@@ -6687,7 +8223,15 @@ class VanCtlHmiCard extends LitElement {
           </div>
         </div>
 
-        ${this._page === 'devices' ? this._renderDevicesPage(safeEntities, slots) : html`
+        ${this._renderViewTabs()}
+
+        ${this._page === 'devices' ? this._renderDevicesPage(safeEntities, slots)
+          : (this._page === 'relays' || this._page === 'switches' || this._page === 'inputs')
+            ? this._renderRelaysView()
+          : (this._page === 'comfort' || this._page === 'climate' || this._page === 'level')
+            ? this._renderComfortView(safeEntities, slots, level)
+          : this._page === 'power' ? this._renderPowerView(safeEntities, slots)
+          : html`
         <div class="main-content">
           <!-- Scene carousel -->
           ${this._renderSceneCarousel()}
@@ -6701,15 +8245,18 @@ class VanCtlHmiCard extends LitElement {
             ${this._showRightPanel ? this._renderRightPanel(safeEntities, slots, level) : ''}
           </div>
         </div>
-
-        <!-- Footer -->
-        ${this._renderFooter(safeEntities, slots)}
         `}
 
+        <!-- Resources footer — outside the page branch so it persists across
+             every view, not just Lighting. .hmi is a flex column, so it sits
+             below whichever page is mounted. -->
+        ${this._renderFooter(safeEntities, slots)}
+
+        ${this._renderConfirmModal()}
+        ${this._renderOverviewTab()}
         ${this._renderAutoModal()}
         ${this._renderTilePopover()}
         ${this._navDrawerOpen ? this._renderNavDrawer() : ''}
-        ${this._renderClimateTab()}
         ${this._footerModal ? this._renderFooterModal() : ''}
         ${this._lightModal ? this._renderLightModal() : ''}
         ${this._editingScene ? html`
@@ -6748,8 +8295,19 @@ class VanCtlHmiCard extends LitElement {
                 ?is-button=${this._editingEntity.startsWith("button.") || this._editingEntity.startsWith("binary_sensor.")}
                 ?is-switch=${this._editingEntity.startsWith("switch.")}
                 .switchMode=${this._switchMode}
+                .powerOnState=${this._powerOnState}
+                .inputMode=${this._inputMode}
+                on-color=${this._onColorSetting ?? ''}
+                .lightGroups=${this._lightGroups}
+                .calPoints=${this._calPoints}
+                cal-kind=${this._calKind ?? 'linear'}
+                cal-live-v=${this._calRawEid ? (this.hass.states[this._calRawEid]?.state ?? '') : ''}
+                cal-min-res=${this._calMinRes ?? ''}
+                cal-max-res=${this._calMaxRes ?? ''}
+                .resourceEdit=${this._resourceEdit}
+                .switchEdit=${this._switchEdit}
                 ?is-light=${this._editingEntity.startsWith("light.") && this._isSmartvanioLight(this._editingEntity)}
-                ?is-tank=${this._editingEntity.startsWith("sensor.") && (this.hass.states[this._editingEntity]?.attributes?.device_class === "volume" || this._editingEntity.includes("tank"))}
+                ?is-tank=${this._calPoints !== null}
                 ?is-sensor=${this._editingEntity.startsWith("sensor.")}
                 .lightSegments=${this._lightSegments}
                 .lightPatterns=${this._lightPatterns}
@@ -6792,6 +8350,21 @@ class VanCtlHmiCard extends LitElement {
                   if (!eid) return;
                   this._applyPattern(eid, e.detail.name, e.detail.stops);
                 }}
+                @smartvanio-set-switch-mode=${(e) => this._setSwitchMode(e.detail.value)}
+                @smartvanio-set-power-on-state=${(e) => this._setPowerOnState(e.detail.value)}
+                @smartvanio-set-input-mode=${(e) => this._setInputMode(e.detail.value)}
+                @smartvanio-update-cal-point=${(e) => this._updateCalPoint(e.detail)}
+                @smartvanio-add-cal-point=${() => this._addCalPoint()}
+                @smartvanio-update-cal-resistance=${(e) => this._updateCalResistance(e.detail)}
+                @smartvanio-update-resource=${(e) => this._updateResourceField(e.detail)}
+                @smartvanio-update-switch=${(e) => this._updateSwitchField(e.detail)}
+                @smartvanio-remove-cal-point=${(e) => this._removeCalPoint(e.detail.index)}
+                @smartvanio-capture-voltage=${(e) => this._captureVoltage(e.detail)}
+                @smartvanio-set-on-color=${(e) => this._setOnColor(e.detail.value)}
+                @smartvanio-toggle-group-member=${(e) => this._toggleGroupMember(e.detail.groupId)}
+                @smartvanio-rename-group=${(e) => this._renameGroup(e.detail.groupId, e.detail.name)}
+                @smartvanio-delete-group=${(e) => this._deleteGroup(e.detail.groupId)}
+                @smartvanio-create-group=${(e) => this._createGroup(e.detail.name)}
                 @smartvanio-update-edit-name=${(e) => {
                   this._editName = e.detail.value;
                 }}
@@ -6947,6 +8520,8 @@ class VanCtlHmiCard extends LitElement {
         /* ── Dark theme (default) ── */
         --sv-bg-base: #050509;
         --sv-bg-surface: #141420;
+        --sv-band-dcdc: rgba(139, 123, 216, 0.18);
+        --sv-band-dcdc-edge: #8B7BD8;
         --sv-bg-elevated: #1C1C2A;
         --sv-bg-rail: #08080C;
         --sv-bg-input: #212830;
@@ -6954,11 +8529,11 @@ class VanCtlHmiCard extends LitElement {
         --sv-border: #2A2A38;
         --sv-border-subtle: #1E1E2A;
         --sv-text-primary: #E8E8F0;
-        --sv-text-heading: var(--sv-text-heading);
+        --sv-text-heading: #F2F2F8;
         --sv-text-secondary: #9898AA;
         --sv-text-disabled: #55556A;
         --sv-accent: #4A9EFF;
-        --sv-accent-hover: var(--sv-accent-hover);
+        --sv-accent-hover: #6BB0FF;
         --sv-accent-muted: rgba(74, 158, 255, 0.15);
         --sv-green: #34C759;
         --sv-amber: #FFB830;
@@ -6966,6 +8541,18 @@ class VanCtlHmiCard extends LitElement {
         --sv-orange: #FF9F0A;
         --sv-radius: 16px;
         --sv-radius-sm: 8px;
+        /* Density scale. One place to trade compactness against touch comfort.
+           .lp-row previously rendered at 134px (96 min-height + 18px padding
+           either side + borders, with no box-sizing) while its content needs
+           ~48px — on a 1280x800 tablet that meant only ~3 lights on screen. */
+        --sv-row-min-h: 56px;
+        --sv-row-pad-y: 10px;
+        --sv-row-pad-x: 14px;
+        --sv-row-gap: 8px;
+        --sv-row-radius: 12px;
+        --sv-scene-w: 124px;   /* max, not fixed — chips size to their label */
+        --sv-scene-h: 42px;
+        --sv-scene-icon: 17px;
         --sv-gauge-track: #151b23;
         --sv-gauge-inactive: #30363d;
         --sv-tile-off-bg: rgba(28,28,30,0.65);
@@ -6994,6 +8581,8 @@ class VanCtlHmiCard extends LitElement {
       :host([theme="light"]) {
         --sv-bg-base: #FDF8F0;
         --sv-bg-surface: #FFFFFF;
+        --sv-band-dcdc: rgba(93, 76, 176, 0.14);
+        --sv-band-dcdc-edge: #5D4CB0;
         --sv-bg-elevated: #F5EDE0;
         --sv-bg-rail: #FAF4EA;
         --sv-bg-input: #F0E8D8;
@@ -7312,22 +8901,34 @@ class VanCtlHmiCard extends LitElement {
       /* ── Scene carousel ────────────────────────────────── */
 
       .sc-hero {
-        padding: 20px 24px 16px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 8px 20px 6px;
         flex-shrink: 0;
+      }
+      .sc-divider {
+        flex: none;
+        width: 1px;
+        align-self: stretch;
+        margin: 3px 0;
+        background: var(--sv-border);
       }
 
       .sc-label {
-        font-size: 12px;
+        font-size: 11px;
         color: var(--sv-text-disabled);
         text-transform: uppercase;
         letter-spacing: 1px;
-        margin: 0 0 12px;
+        margin: 0 0 7px;
         font-weight: 600;
       }
 
       .sc-carousel {
+        flex: 1;
+        min-width: 0;
         display: flex;
-        gap: 12px;
+        gap: 8px;
         overflow-x: auto;
         padding-bottom: 4px;
         scroll-snap-type: x mandatory;
@@ -7335,22 +8936,26 @@ class VanCtlHmiCard extends LitElement {
 
       .sc-carousel::-webkit-scrollbar { height: 0; }
 
+      /* A single row — icon, name, colour dots — rather than a stacked card.
+         The scene strip sits above the lights on every visit, so its height is
+         paid for constantly; at 64px tall it cost roughly one list row. */
       .sc-card {
+        box-sizing: border-box;
         flex-shrink: 0;
-        width: 160px;
-        height: 100px;
-        border-radius: var(--sv-radius);
+        max-width: var(--sv-scene-w);
+        height: var(--sv-scene-h);
+        border-radius: var(--sv-row-radius);
         background: var(--sv-bg-surface);
         border: 1px solid var(--sv-border);
-        padding: 16px;
+        padding: 0 11px;
         cursor: pointer;
-        transition: all 0.25s;
+        transition: border-color 0.25s, box-shadow 0.25s, transform 0.15s;
         scroll-snap-align: start;
         user-select: none;
         display: flex;
-        flex-direction: column;
-        justify-content: flex-end;
-        gap: 8px;
+        flex-direction: row;
+        align-items: center;
+        gap: 7px;
         box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
       }
 
@@ -7360,12 +8965,13 @@ class VanCtlHmiCard extends LitElement {
 
       .sc-card-icon {
         color: rgba(255, 255, 255, 0.85);
-        --mdc-icon-size: 32px;
+        --mdc-icon-size: var(--sv-scene-icon);
         filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.3));
+        flex: none;
       }
 
       .sc-card-name {
-        font-size: 14px;
+        font-size: 12px;
         font-weight: 600;
         white-space: nowrap;
         overflow: hidden;
@@ -7375,12 +8981,14 @@ class VanCtlHmiCard extends LitElement {
 
       .sc-dots {
         display: flex;
-        gap: 4px;
+        gap: 3px;
+        flex: none;
+        margin-left: auto;
       }
 
       .sc-dot {
-        width: 7px;
-        height: 7px;
+        width: 5px;
+        height: 5px;
         border-radius: 50%;
         box-shadow: 0 0 3px rgba(0, 0, 0, 0.2);
       }
@@ -7432,7 +9040,7 @@ class VanCtlHmiCard extends LitElement {
       /* ── Lights panel (left) ───────────────────────────── */
 
       .lp-panel {
-        padding: 16px 20px;
+        padding: 14px 20px 16px;
         overflow-y: auto;
         border-right: 1px solid var(--sv-border);
         touch-action: pan-y;
@@ -7463,10 +9071,24 @@ class VanCtlHmiCard extends LitElement {
         letter-spacing: 0;
       }
 
+      .lp-area {
+        grid-column: 1 / -1;
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        margin: 6px 0 0;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--sv-text-secondary);
+      }
+      .lp-area:first-child { margin-top: 0; }
+
       .lp-list {
         display: grid;
         grid-template-columns: 1fr;
-        gap: 12px;
+        gap: var(--sv-row-gap);
       }
 
       /* Column count is driven by .lp-panel's width (container query).
@@ -7502,14 +9124,15 @@ class VanCtlHmiCard extends LitElement {
       }
 
       .lp-row {
+        box-sizing: border-box;
         display: flex;
         flex-direction: column;
-        gap: 14px;
-        padding: 18px;
-        min-height: 96px;
+        gap: 8px;
+        padding: var(--sv-row-pad-y) var(--sv-row-pad-x);
+        min-height: var(--sv-row-min-h);
         background: var(--sv-bg-surface);
         border: 1px solid var(--sv-border);
-        border-radius: var(--sv-radius);
+        border-radius: var(--sv-row-radius);
         transition: all 0.25s;
         user-select: none;
         cursor: pointer;
@@ -7528,7 +9151,7 @@ class VanCtlHmiCard extends LitElement {
       .lp-header {
         display: flex;
         align-items: center;
-        gap: 16px;
+        gap: 12px;
         width: 100%;
         cursor: pointer;
         min-height: 48px;
@@ -7780,8 +9403,478 @@ class VanCtlHmiCard extends LitElement {
 
       .dev-page {
         flex: 1;
+        min-height: 0;   /* flex children need this to scroll instead of pushing the footer off */
         overflow-y: auto;
         padding: 16px 20px;
+      }
+      .sw-empty { color: var(--sv-text-secondary); font-size: 13px; }
+      .sw-edit {
+        background: none;
+        border: none;
+        padding: 4px 6px;
+        margin-left: 4px;
+        color: var(--sv-text-disabled);
+        cursor: pointer;
+        flex-shrink: 0;
+      }
+      .sw-edit:hover { color: var(--sv-text-primary); }
+      .lp-input-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        flex-shrink: 0;
+        margin-right: 12px;
+        box-shadow: 0 0 0 1px var(--sv-border) inset;
+      }
+      .vtabs {
+        flex: none;
+        display: flex;
+        align-items: stretch;
+        gap: 4px;
+        padding: 0 16px;
+        background: var(--sv-bg-rail);
+        border-bottom: 1px solid var(--sv-border-subtle);
+      }
+      .vtab {
+        appearance: none;
+        background: none;
+        border: 0;
+        border-bottom: 2px solid transparent;
+        color: var(--sv-text-secondary);
+        font: inherit;
+        font-size: 13px;
+        padding: 0 18px;
+        min-height: 44px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        cursor: pointer;
+        transition: color 0.15s, border-color 0.15s;
+      }
+      .vtab:hover { color: var(--sv-text-primary); }
+      .vtab.active { color: var(--sv-text-primary); border-bottom-color: var(--sv-accent); }
+      .vtab:focus-visible { outline: 2px solid var(--sv-accent); outline-offset: -2px; }
+
+      .pw-page { padding: 14px 20px; }
+      /* Multi-column, not grid. Cards vary from 1 to 6 rows, and CSS Grid sizes
+         every row to its tallest card — so a short card beside a tall one leaves
+         a block of dead space. Columns flow cards vertically and pack them. */
+      .pw-grid {
+        column-width: 320px;
+        column-gap: 12px;
+      }
+      .pw-card {
+        box-sizing: border-box;
+        display: block;
+        width: 100%;
+        break-inside: avoid;
+        -webkit-column-break-inside: avoid;
+        margin: 0 0 12px;
+        background: var(--sv-bg-surface);
+        border: 1px solid var(--sv-border);
+        border-radius: var(--sv-row-radius);
+        padding: 12px 14px;
+      }
+      .pw-h {
+        margin: 0 0 10px;
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--sv-text-secondary);
+        font-weight: 600;
+        display: flex;
+        gap: 8px;
+        align-items: baseline;
+      }
+      /* The level panel is built for a full swiper page; rein it in inside a card. */
+      .pw-card .panel-level { padding: 2px 0 4px; gap: 12px; }
+      .pw-card .bubble-lg { max-width: min(160px, 100%); }
+
+      /* ── Confirm dialog ──────────────────────────────────── */
+      .cf-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 60;
+        background: rgba(0, 0, 0, 0.6);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+      }
+      .cf-box {
+        box-sizing: border-box;
+        width: 100%;
+        max-width: 380px;
+        background: var(--sv-bg-surface);
+        border: 1px solid var(--sv-border);
+        border-radius: var(--sv-radius);
+        padding: 18px 20px 16px;
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+      }
+      .cf-title { margin: 0 0 8px; font-size: 17px; font-weight: 650; color: var(--sv-text-primary); }
+      .cf-body { margin: 0 0 16px; font-size: 13px; line-height: 1.5; color: var(--sv-text-secondary); }
+      .cf-body b { color: var(--sv-text-primary); font-weight: 600; }
+      .cf-actions { display: flex; justify-content: flex-end; gap: 8px; }
+      .cf-btn {
+        appearance: none;
+        background: var(--sv-bg-elevated);
+        border: 1px solid var(--sv-border);
+        border-radius: var(--sv-radius-sm);
+        color: var(--sv-text-primary);
+        font: inherit;
+        font-size: 13px;
+        padding: 9px 16px;
+        min-height: 44px;
+        cursor: pointer;
+      }
+      .cf-btn:hover { border-color: var(--sv-text-secondary); }
+      .cf-primary { border-color: var(--sv-accent); background: rgba(74, 158, 255, 0.16); }
+      .cf-danger { border-color: var(--sv-red); background: rgba(255, 69, 58, 0.16); color: var(--sv-red); }
+
+      .lv-switch {
+        flex: none;
+        display: inline-flex;
+        gap: 2px;
+        padding: 2px;
+        background: var(--sv-bg-base);
+        border: 1px solid var(--sv-border-subtle);
+        border-radius: var(--sv-radius-sm);
+      }
+      .lv-tab {
+        padding: 5px 12px;
+        font: inherit;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--sv-text-disabled);
+        background: none;
+        border: none;
+        border-radius: calc(var(--sv-radius-sm) - 3px);
+        cursor: pointer;
+      }
+      .lv-tab.active {
+        color: var(--sv-text-primary);
+        background: var(--sv-bg-surface);
+      }
+      .lv-hint {
+        margin: 10px 0 0;
+        font-size: 11px;
+        color: var(--sv-text-disabled);
+      }
+
+      /* ── Light groups ─────────────────────────────────────── */
+      .grp-row {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        cursor: default;
+      }
+      .grp-row .lp-header { cursor: pointer; }
+      .grp-members {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+      }
+      .grp-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        max-width: 100%;
+        padding: 4px 8px;
+        font: inherit;
+        font-size: 11px;
+        line-height: 1.2;
+        color: var(--sv-text-disabled);
+        background: var(--sv-bg-base);
+        border: 1px solid var(--sv-border-subtle);
+        border-radius: 999px;
+        cursor: pointer;
+      }
+      .grp-chip span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .grp-chip.on {
+        color: var(--sv-text-primary);
+        border-color: var(--sv-border);
+      }
+      .grp-chip.unavail { opacity: 0.5; cursor: default; }
+      .cf-btn:focus-visible { outline: 2px solid var(--sv-accent); outline-offset: 2px; }
+
+      /* ── Power view: stat strip + full-width chart ────────── */
+      .ps-page {
+        padding: 12px 20px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        min-height: 0;
+        overflow-y: auto;
+      }
+      .ps-page > .ps-strip { flex: none; }
+      .ps-strip {
+        flex: none;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 10px;
+      }
+      .ps-card {
+        box-sizing: border-box;
+        background: var(--sv-bg-surface);
+        border: 1px solid var(--sv-border);
+        border-radius: var(--sv-row-radius);
+        padding: 10px 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        min-width: 0;
+      }
+      .ps-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+      .ps-label {
+        font-size: 10px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        color: var(--sv-text-secondary);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .ps-value {
+        font-size: 24px;
+        font-weight: 700;
+        line-height: 1.05;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      .ps-value i {
+        font-style: normal;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--sv-text-secondary);
+        margin-left: 2px;
+      }
+      .ps-chart {
+        flex: 1 1 auto;
+        min-height: 260px;
+        display: flex;
+        flex-direction: column;
+      }
+      .pw-h small {
+        margin-left: auto;
+        font-size: 10px;
+        letter-spacing: 0.04em;
+        text-transform: none;
+        font-weight: 500;
+        color: var(--sv-text-disabled);
+      }
+
+      /* ── uPlot (structural rules inlined; its stylesheet cannot
+             cross the shadow DOM boundary) ────────────────────── */
+      .uplot, .uplot *, .uplot *::before, .uplot *::after { box-sizing: border-box; }
+      .uplot {
+        font-family: inherit;
+        line-height: 1.5;
+        width: min-content;
+        color: var(--sv-text-secondary);
+      }
+      .u-wrap { position: relative; user-select: none; }
+      .u-over, .u-under { position: absolute; }
+      .u-under { overflow: hidden; }
+      .uplot canvas { display: block; position: relative; width: 100%; height: 100%; }
+      .u-axis { position: absolute; }
+      .u-select { background: rgba(74,158,255,0.12); position: absolute; pointer-events: none; }
+      .u-cursor-x, .u-cursor-y { position: absolute; left: 0; top: 0; pointer-events: none; will-change: transform; }
+      .u-hz .u-cursor-x, .u-vt .u-cursor-y { height: 100%; border-right: 1px dashed var(--sv-text-disabled); }
+      .u-hz .u-cursor-y, .u-vt .u-cursor-x { width: 100%; border-bottom: 1px dashed var(--sv-text-disabled); }
+      .u-cursor-pt {
+        position: absolute;
+        top: 0; left: 0;
+        border-radius: 50%;
+        border: 1px solid var(--sv-bg-surface);
+        pointer-events: none;
+        will-change: transform;
+      }
+      .u-hz .u-cursor-x, .u-vt .u-cursor-y, .u-cursor-pt { z-index: 1; }
+      .u-legend { font-size: 12px; margin: 6px 0 0; text-align: left; color: var(--sv-text-secondary); }
+      .u-inline { display: block; }
+      .u-inline * { display: inline-block; }
+      .u-inline tr { margin-right: 16px; }
+      .u-legend th { font-weight: 600; color: var(--sv-text-primary); }
+      .u-legend th > * { vertical-align: middle; display: inline-block; }
+      .u-legend .u-marker {
+        width: 10px;
+        height: 10px;
+        margin-right: 6px;
+        border-radius: 2px;
+        background-clip: padding-box !important;
+      }
+      .u-inline.u-live th::after { content: ":"; vertical-align: middle; color: var(--sv-text-disabled); }
+      .u-inline:not(.u-live) .u-value { display: none; }
+      .u-series > * { padding: 2px 3px; }
+      .u-series th { cursor: pointer; }
+      .u-legend .u-value { font-variant-numeric: tabular-nums; color: var(--sv-text-primary); }
+      .u-legend .u-off > * { opacity: 0.35; }
+      .u-axis.u-off, .u-select.u-off, .u-cursor-x.u-off,
+      .u-cursor-y.u-off, .u-cursor-pt.u-off { display: none; }
+
+      .uplot-host { width: 100%; flex: 1 1 auto; min-height: 200px; }
+      .uplot-host .uplot { width: 100%; }
+      .pc-ranges-below { justify-content: flex-end; flex: none; }
+      .pc-foot {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-top: 6px;
+        flex: none;
+      }
+      .pc-foot .pc-ranges { margin-left: auto; }
+      .pc-band-key {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+        color: var(--sv-text-secondary);
+        cursor: help;
+      }
+      .pc-band-swatch {
+        width: 16px;
+        height: 10px;
+        border-radius: 2px;
+        background: var(--sv-band-dcdc);
+        border: 1px solid var(--sv-band-dcdc-edge);
+        flex: none;
+      }
+
+      /* ── Power chart ─────────────────────────────────────── */
+      .pc-ranges { display: flex; gap: 4px; flex: none; }
+      .pc-range {
+        appearance: none;
+        background: none;
+        border: 1px solid var(--sv-border);
+        border-radius: var(--sv-radius-sm);
+        color: var(--sv-text-secondary);
+        font: inherit;
+        font-size: 11px;
+        padding: 4px 9px;
+        min-height: 28px;
+        cursor: pointer;
+      }
+      .pc-range.active {
+        color: var(--sv-text-primary);
+        border-color: var(--sv-accent);
+        background: rgba(74, 158, 255, 0.12);
+      }
+
+      .cl-page { padding: 14px 20px; }
+      .cl-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        gap: 12px;
+        align-items: start;
+      }
+      /* The dial is the centrepiece — give it two tracks when there's room. */
+      @media (min-width: 1000px) {
+        .cl-heater { grid-column: span 2; }
+      }
+      .cl-heater .panel-climate { padding: 4px 0 0; }
+
+      .cl-readouts {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+        gap: 10px;
+      }
+      .cl-readout {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        padding: 8px 10px;
+        background: var(--sv-bg-elevated);
+        border-radius: var(--sv-radius-sm);
+      }
+      .cl-readout-label {
+        font-size: 11px;
+        color: var(--sv-text-secondary);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .cl-readout-val {
+        font-size: 19px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+      }
+      .cl-readout-val i {
+        font-style: normal;
+        font-size: 12px;
+        color: var(--sv-text-secondary);
+        margin-left: 2px;
+      }
+
+      .pw-btns { display: flex; flex-wrap: wrap; gap: 8px; }
+      .pw-btn {
+        appearance: none;
+        background: var(--sv-bg-elevated);
+        border: 1px solid var(--sv-border);
+        border-radius: var(--sv-radius-sm);
+        color: var(--sv-text-primary);
+        font: inherit;
+        font-size: 13px;
+        padding: 10px 14px;
+        min-height: 44px;
+        cursor: pointer;
+      }
+      .pw-btn:hover { border-color: var(--sv-accent); }
+      .pw-btn:focus-visible { outline: 2px solid var(--sv-accent); outline-offset: 2px; }
+
+      .pw-soc {
+        font-size: 34px;
+        font-weight: 700;
+        line-height: 1;
+        margin-bottom: 8px;
+        font-variant-numeric: tabular-nums;
+      }
+      .pw-stats { display: flex; gap: 18px; flex-wrap: wrap; }
+      .pw-stat { display: flex; flex-direction: column; gap: 2px; }
+      .pw-stat span { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--sv-text-secondary); }
+      .pw-stat b { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+      .pw-tanks { display: flex; flex-direction: column; gap: 10px; }
+      .pw-tank { display: flex; flex-direction: column; gap: 5px; }
+      .pw-tank-top { display: flex; justify-content: space-between; font-size: 13px; }
+      .pw-tank-pct { color: var(--sv-text-secondary); font-variant-numeric: tabular-nums; }
+      .pw-tank-bar {
+        height: 5px;
+        background: var(--sv-bg-input);
+        border-radius: 3px;
+        overflow: hidden;
+      }
+      .pw-tank-bar i { display: block; height: 100%; border-radius: 3px; }
+
+      .dev-page-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 14px;
+      }
+      .dev-back {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px 6px 8px;
+        border: 1px solid var(--sv-border);
+        border-radius: 8px;
+        background: var(--sv-bg-elevated);
+        color: var(--sv-text-primary);
+        font-size: 13px;
+        cursor: pointer;
+      }
+      .dev-back:hover  { background: var(--sv-border-subtle); }
+      .dev-back ha-icon { --mdc-icon-size: 18px; }
+      .dev-page-title {
+        font-size: 15px;
+        font-weight: 600;
+        color: var(--sv-text-secondary);
       }
       .dev-page::-webkit-scrollbar { width: 3px; }
       .dev-page::-webkit-scrollbar-thumb { background: var(--sv-border); border-radius: 2px; }
@@ -8060,7 +10153,7 @@ class VanCtlHmiCard extends LitElement {
         display: flex;
         align-items: center;
         gap: 6px;
-        padding: 0 16px;
+        padding: 0 22px;
         background: none;
         border: none;
         border-left: 1px solid var(--sv-border);
@@ -8078,7 +10171,7 @@ class VanCtlHmiCard extends LitElement {
       .ft-sw.on { color: var(--sv-text-primary); }
 
       .ft-sw.icon-only {
-        padding: 0 14px;
+        padding: 0 18px;
         color: var(--sv-text-disabled);
         transition: background 0.2s, color 0.2s;
       }
@@ -8161,6 +10254,9 @@ class VanCtlHmiCard extends LitElement {
       .layout-item:active { cursor: grabbing; }
 
       .layout-item.hidden-item { opacity: 0.35; }
+      /* Switch/input rows carry .hidden-item without .layout-item, so they need
+         their own rule to read as hidden while editing. */
+      .lp-row.hidden-item { opacity: 0.35; }
 
       .layout-overlay {
         position: absolute;
@@ -10830,13 +12926,11 @@ class VanCtlHmiCard extends LitElement {
 
       @media (max-width: 1400px) {
         /* Shrink scene tiles */
-        .sc-card {
-          width: 110px;
-          height: 60px;
-          padding: 8px 10px;
-          gap: 4px;
+        :host {
+          --sv-scene-w: 104px;
+          --sv-scene-h: 38px;
+          --sv-scene-icon: 16px;
         }
-        .sc-card-icon { --mdc-icon-size: 18px; }
         .sc-card-name { font-size: 11px; }
         .sc-dots { display: none; }
 
@@ -10853,10 +12947,16 @@ class VanCtlHmiCard extends LitElement {
         .lstat-val { font-size: 18px; }
         .lstat-label { font-size: 8px; }
 
-        /* Light rows compact */
-        .lp-row {
-          gap: 8px;
+        /* Tablet density. This previously set only the flex gap, which does
+           nothing on a single-child column, so tablets got no reduction. */
+        :host {
+          --sv-row-min-h: 52px;
+          --sv-row-pad-y: 8px;
+          --sv-row-pad-x: 12px;
+          --sv-row-gap: 8px;
         }
+        .lp-name { font-size: 15px; }
+        .lp-bri { font-size: 12px; margin-top: 1px; }
       }
     `;
   }

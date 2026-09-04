@@ -34,6 +34,11 @@ class VanCtlModalEdit extends LitElement {
       editLoading:      { type: Boolean, attribute: "edit-loading" },
       calPoints:        { type: Array },
       calKind:          { type: String, attribute: "cal-kind" },
+      calLiveV:         { type: String, attribute: "cal-live-v" },
+      calMinRes:        { type: String, attribute: "cal-min-res" },
+      calMaxRes:        { type: String, attribute: "cal-max-res" },
+      resourceEdit:     { type: Object },  // { idx, name, color, icon } for a footer resource, or null
+      switchEdit:       { type: Object },  // { idx, name, color, icon, confirm } for a footer switch, or null
       lightSegments:    { type: Array },
       maxLeds:          { type: Number, attribute: "max-leds" },
       expandedSegColor: { type: String, attribute: "expanded-seg-color" },
@@ -41,6 +46,10 @@ class VanCtlModalEdit extends LitElement {
       isButton:         { type: Boolean, attribute: "is-button" },
       isSwitch:         { type: Boolean, attribute: "is-switch" },
       switchMode:       { type: Object },  // { entityId, options:[], current } for NO/NC relay mode, or null
+      powerOnState:     { type: Object },  // { entityId, options:[], current } for a light's power-on state, or null
+      onColor:          { type: String, attribute: "on-color" },  // Kelvin, or "last"
+      lightGroups:      { type: Array },   // [{ id, name, member }] for this light
+      inputMode:        { type: Object },  // { entityId, options:[], current } for a resistive input's mode, or null
       isTank:           { type: Boolean, attribute: "is-tank" },
       isLight:          { type: Boolean, attribute: "is-light" },
       isSensor:         { type: Boolean, attribute: "is-sensor" },
@@ -64,8 +73,18 @@ class VanCtlModalEdit extends LitElement {
     this._modalView = null; // null = auto ('control' for lights, 'settings' otherwise)
     this.maxLeds = 0;
     this.switchMode = null;
+    this.powerOnState = null;
+    this.onColor = "";
+    this.lightGroups = null;
+    this._newGroupName = "";
+    this.inputMode = null;
     this.calPoints = null;
     this.calKind = "linear";
+    this.calLiveV = "";
+    this.calMinRes = "";
+    this.calMaxRes = "";
+    this.resourceEdit = null;
+    this.switchEdit = null;
     this.targetEntities = [];
     this.sourceEntities = [];
     this._presetColors = [
@@ -371,6 +390,53 @@ class VanCtlModalEdit extends LitElement {
 
   // ─── Emit helpers ───────────────────────────────────────────────
 
+  /** Targets for an automation row. Multiple targets are supported: the row's
+   *  target_entity_id may be a string (legacy, one target) or an array. */
+  _rowTargets(row) {
+    const t = row?.target_entity_id;
+    if (Array.isArray(t)) return t.filter(Boolean);
+    return t ? [t] : [];
+  }
+
+  _renderTargets(row, i) {
+    const targets = this._rowTargets(row);
+    const update = (list) => this._emit("smartvanio-update-edit-row", {
+      id: i, field: "target_entity_id", value: list.length > 1 ? list : (list[0] ?? ""),
+    });
+    return html`
+      <div class="tgt-wrap">
+        ${targets.length ? html`
+          <div class="tgt-chips">
+            ${targets.map((t) => html`
+              <span class="tgt-chip">
+                <span class="tgt-chip-name">${this.hass?.states?.[t]?.attributes?.friendly_name ?? t}</span>
+                <button class="tgt-chip-x" title="Remove target"
+                  @click=${() => update(targets.filter((x) => x !== t))}>
+                  <ha-icon icon="mdi:close" style="--mdc-icon-size:13px"></ha-icon>
+                </button>
+              </span>
+            `)}
+          </div>
+        ` : ''}
+        <smartvanio-entity-picker
+          .hass=${this.hass}
+          .value=${''}
+          .domains=${["light", "switch", "fan", "scene", "cover", "lock"]}
+          .excludeEntities=${targets}
+          pinned-entity=${this.entityId}
+          placeholder=${targets.length ? "Add another target…" : "Select target…"}
+          @smartvanio-change=${(e) => {
+            const v = e.detail.value;
+            if (v && !targets.includes(v)) update([...targets, v]);
+          }}
+        ></smartvanio-entity-picker>
+        ${targets.length > 1 ? html`
+          <p class="tgt-hint">Toggle keeps these in sync — if any is on, all turn off; otherwise all turn on.</p>
+        ` : ''}
+      </div>
+    `;
+  }
+
   _emit(name, detail = {}) {
     this.dispatchEvent(new CustomEvent(name, {
       detail,
@@ -382,14 +448,32 @@ class VanCtlModalEdit extends LitElement {
   // ─── Calibration section ─────────────────────────────────────────
 
   _renderCalibrationSection() {
-    const voltageId = this.entityId + "_voltage";
-    const liveV = parseFloat(this.hass?.states[voltageId]?.state ?? 0);
+    const liveV = parseFloat(this.calLiveV);
     const pts = this.calPoints ?? [];
     return html`
       <div class="modal-section">
         <div class="modal-section-header">
+          <span class="modal-label">Sensor range</span>
+        </div>
+        <div class="cal-res-row">
+          <label class="cal-res-field">
+            <span class="cal-col-hdr">Min resistance (Ω)</span>
+            <input type="number" class="cal-input" min="0" max="15000" step="1"
+              .value=${String(this.calMinRes ?? "")}
+              @change=${(e) => this._emit("smartvanio-update-cal-resistance", { field: "min", value: e.target.value })} />
+          </label>
+          <label class="cal-res-field">
+            <span class="cal-col-hdr">Max resistance (Ω)</span>
+            <input type="number" class="cal-input" min="0" max="15000" step="1"
+              .value=${String(this.calMaxRes ?? "")}
+              @change=${(e) => this._emit("smartvanio-update-cal-resistance", { field: "max", value: e.target.value })} />
+          </label>
+        </div>
+      </div>
+      <div class="modal-section">
+        <div class="modal-section-header">
           <span class="modal-label">Calibration</span>
-          <span class="cal-live">Live: ${liveV.toFixed(3)} V</span>
+          <span class="cal-live">${Number.isNaN(liveV) ? "Live: —" : `Live: ${liveV.toFixed(3)} V`}</span>
         </div>
         <div class="cal-header-row">
           <span class="cal-col-hdr">Voltage (V)</span>
@@ -436,6 +520,10 @@ class VanCtlModalEdit extends LitElement {
         <button class="add-row-btn" @click=${() => this._emit("smartvanio-add-cal-point")}>
           <ha-icon icon="mdi:plus"></ha-icon> Add Point
         </button>
+        <p class="cal-hint">
+          Changes apply to the sensor as you make them, so the reading updates
+          while you tune. Cancel puts the previous calibration back.
+        </p>
       </div>
       <div class="modal-section">
         <label class="modal-label">Interpolation Type</label>
@@ -449,6 +537,93 @@ class VanCtlModalEdit extends LitElement {
           ]}
           @smartvanio-change=${(e) => this._emit("smartvanio-update-cal-point", { field: "kind", value: e.detail.value })}
         ></smartvanio-select>
+      </div>
+    `;
+  }
+
+  // ─── Groups ──────────────────────────────────────────────────────
+
+  _renderGroupsSection() {
+    const groups = this.lightGroups ?? [];
+    return html`
+      <div class="modal-section">
+        <label class="modal-label">Groups</label>
+        ${groups.length ? html`
+          <div class="grp-list">
+            ${groups.map((g) => html`
+              <div class="grp-row-edit ${g.member ? "on" : ""}">
+                <button class="grp-check" title=${g.member ? "Remove from group" : "Add to group"}
+                  @click=${() => this._emit("smartvanio-toggle-group-member", { groupId: g.id })}>
+                  <ha-icon icon=${g.member ? "mdi:checkbox-marked" : "mdi:checkbox-blank-outline"}
+                    style="--mdc-icon-size:18px"></ha-icon>
+                </button>
+                <input class="grp-name" type="text" .value=${g.name}
+                  @change=${(e) => this._emit("smartvanio-rename-group", { groupId: g.id, name: e.target.value })} />
+                <button class="grp-trash" title="Delete group"
+                  @click=${() => this._emit("smartvanio-delete-group", { groupId: g.id })}>
+                  <ha-icon icon="mdi:delete-outline" style="--mdc-icon-size:18px"></ha-icon>
+                </button>
+              </div>
+            `)}
+          </div>
+        ` : html`<p class="switch-mode-hint">No groups yet.</p>`}
+        <div class="grp-new">
+          <input class="grp-name" type="text" placeholder="New group name"
+            .value=${this._newGroupName}
+            @input=${(e) => { this._newGroupName = e.target.value; }}
+            @keydown=${(e) => { if (e.key === "Enter") this._createGroup(); }} />
+          <button class="grp-add" ?disabled=${!this._newGroupName.trim()}
+            @click=${() => this._createGroup()}>
+            <ha-icon icon="mdi:plus" style="--mdc-icon-size:16px"></ha-icon>
+            <span>Add</span>
+          </button>
+        </div>
+        <p class="switch-mode-hint">
+          Ticked groups include this light. Switch between lights and groups
+          from the tabs at the top of the Lighting page.
+        </p>
+      </div>
+    `;
+  }
+
+  _createGroup() {
+    const name = this._newGroupName.trim();
+    if (!name) return;
+    this._emit("smartvanio-create-group", { name });
+    this._newGroupName = "";
+    this.requestUpdate();
+  }
+
+  // ─── Switch-on colour ────────────────────────────────────────────
+
+  _renderOnColorSection() {
+    const current = String(this.onColor ?? "2700");
+    const presets = [
+      { value: "2700", label: "Warm",    swatch: "#FFA957" },
+      { value: "4000", label: "Neutral", swatch: "#FFD3AE" },
+      { value: "6500", label: "Cool",    swatch: "#FFFAFD" },
+      { value: "last", label: "Last used", swatch: null },
+    ];
+    return html`
+      <div class="modal-section">
+        <label class="modal-label">Colour when switched on</label>
+        <div class="onc-row">
+          ${presets.map((p) => html`
+            <button
+              class="onc-opt ${current === p.value ? "active" : ""}"
+              @click=${() => this._emit("smartvanio-set-on-color", { value: p.value })}
+            >
+              ${p.swatch
+                ? html`<i class="onc-swatch" style="background:${p.swatch}"></i>`
+                : html`<ha-icon class="onc-icon" icon="mdi:history"></ha-icon>`}
+              <span>${p.label}</span>
+            </button>
+          `)}
+        </div>
+        <p class="switch-mode-hint">
+          The colour this light comes up at when a wall switch or button turns it on.
+          "Last used" leaves whatever colour it had before.
+        </p>
       </div>
     `;
   }
@@ -1040,14 +1215,7 @@ class VanCtlModalEdit extends LitElement {
               </div>
               <div class="auto-row-target">
                 <span class="auto-row-label-text">Target</span>
-                <smartvanio-entity-picker
-                  .hass=${this.hass}
-                  .value=${row.target_entity_id}
-                  .domains=${["light", "switch", "fan", "scene", "cover", "lock"]}
-                  pinned-entity=${this.entityId}
-                  placeholder="Select target…"
-                  @smartvanio-change=${(e) => this._emit("smartvanio-update-edit-row", { id: i, field: "target_entity_id", value: e.detail.value })}
-                ></smartvanio-entity-picker>
+                ${this._renderTargets(row, i)}
               </div>
               <div class="auto-row-action">
                 <span class="auto-row-label-text">Action</span>
@@ -1158,6 +1326,70 @@ class VanCtlModalEdit extends LitElement {
                       ${this._renderAreaPicker()}
                     </div>
 
+                    ${this.switchEdit ? html`
+                    <div class="modal-section">
+                      <label class="modal-label">Footer label</label>
+                      <input class="modal-input" type="text"
+                        .value=${this.switchEdit.name ?? ""}
+                        @input=${(e) => this._emit("smartvanio-update-switch", { field: "name", value: e.target.value })} />
+                    </div>
+                    <div class="modal-section res-appearance">
+                      <div class="res-color-field">
+                        <label class="modal-label">Colour</label>
+                        <input type="color" class="res-color"
+                          .value=${this.switchEdit.color || "#4a9eff"}
+                          @input=${(e) => this._emit("smartvanio-update-switch", { field: "color", value: e.target.value })} />
+                      </div>
+                      <div class="res-icon-field">
+                        <label class="modal-label">Icon</label>
+                        <smartvanio-icon-picker .value=${this.switchEdit.icon ?? ""}
+                          @smartvanio-change=${(e) => this._emit("smartvanio-update-switch", { field: "icon", value: e.detail.value })}
+                        ></smartvanio-icon-picker>
+                      </div>
+                    </div>
+                    <div class="modal-section">
+                      <label class="modal-label">Ask before switching</label>
+                      <smartvanio-select
+                        .value=${this.switchEdit.confirm ?? "never"}
+                        .options=${[
+                          { value: "never",  label: "Never" },
+                          { value: "off",    label: "When turning off" },
+                          { value: "on",     label: "When turning on" },
+                          { value: "always", label: "Always" },
+                        ]}
+                        @smartvanio-change=${(e) => this._emit("smartvanio-update-switch", { field: "confirm", value: e.detail.value })}
+                      ></smartvanio-select>
+                      <p class="switch-mode-hint">Use "When turning off" for anything you cannot switch back on remotely — turning Starlink off means no connection until someone is at the van.</p>
+                    </div>
+                    ` : ""}
+
+                    ${this.resourceEdit ? html`
+                    <div class="modal-section">
+                      <label class="modal-label">Footer label</label>
+                      <input
+                        class="modal-input"
+                        type="text"
+                        placeholder="e.g. Fresh water"
+                        .value=${this.resourceEdit.name ?? ""}
+                        @input=${(e) => this._emit("smartvanio-update-resource", { field: "name", value: e.target.value })}
+                      />
+                    </div>
+                    <div class="modal-section res-appearance">
+                      <div class="res-color-field">
+                        <label class="modal-label">Colour</label>
+                        <input type="color" class="res-color"
+                          .value=${this.resourceEdit.color || "#4a9eff"}
+                          @input=${(e) => this._emit("smartvanio-update-resource", { field: "color", value: e.target.value })} />
+                      </div>
+                      <div class="res-icon-field">
+                        <label class="modal-label">Icon</label>
+                        <smartvanio-icon-picker .value=${this.resourceEdit.icon ?? ""}
+                          @smartvanio-change=${(e) => this._emit("smartvanio-update-resource", { field: "icon", value: e.detail.value })}
+                        ></smartvanio-icon-picker>
+                      </div>
+                    </div>
+                    ` : ""}
+
                     ${this.isSwitch && this.switchMode ? html`
                     <div class="modal-section">
                       <label class="modal-label">Relay Mode</label>
@@ -1170,11 +1402,39 @@ class VanCtlModalEdit extends LitElement {
                     </div>
                     ` : ""}
 
-                    ${this.isTank ? this._renderCalibrationSection() : ""}
+                    ${this.isLight && this.lightGroups ? this._renderGroupsSection() : ""}
+
+                    ${this.isLight && this.onColor ? this._renderOnColorSection() : ""}
+
+                    ${this.isLight && this.powerOnState ? html`
+                    <div class="modal-section">
+                      <label class="modal-label">Power-on state</label>
+                      <smartvanio-select
+                        .value=${this.powerOnState.current}
+                        .options=${(this.powerOnState.options ?? []).map(o => ({ value: o, label: o }))}
+                        @smartvanio-change=${(e) => this._emit("smartvanio-set-power-on-state", { value: e.detail.value })}
+                      ></smartvanio-select>
+                      <p class="switch-mode-hint">What this channel does when the board is powered up. "Restore" returns it to its last state, "On" always comes up lit, "Off" always comes up dark.</p>
+                    </div>
+                    ` : ""}
+
+                    ${this.inputMode ? html`
+                    <div class="modal-section">
+                      <label class="modal-label">Input mode</label>
+                      <smartvanio-select
+                        .value=${this.inputMode.current}
+                        .options=${(this.inputMode.options ?? []).map(o => ({ value: o, label: o }))}
+                        @smartvanio-change=${(e) => this._emit("smartvanio-set-input-mode", { value: e.detail.value })}
+                      ></smartvanio-select>
+                      <p class="switch-mode-hint">"Sensor" reads a resistive tank level. "Switch (NO)" is active when the circuit closes — a normally-open switch being pressed. "Switch (NC)" is active when the circuit opens. Calibration only applies in Sensor mode.</p>
+                    </div>
+                    ` : ""}
+
                   </div>
 
                   <div class="modal-col-right">
-                    ${this.isLight ? html`
+                    ${this.isLight && !this.maxLeds ? this._renderAutomationsSection()
+                      : this.isLight ? html`
                       <div class="right-tabs">
                         <button class="right-tab ${(this._rightTab ?? 'segments') === 'segments' ? 'active' : ''}"
                           @click=${() => { this._rightTab = 'segments'; this._emit("smartvanio-segment-preview"); }}>Segments</button>
@@ -1195,6 +1455,17 @@ class VanCtlModalEdit extends LitElement {
                           ? this._renderPatternsSection()
                           : this._renderAutomationsSection()}
                     ` : this.isSensor ? html`
+                    ${this.isTank ? html`
+                      <div class="right-tabs">
+                        <button class="right-tab ${(this._rightTab ?? 'automations') === 'automations' ? 'active' : ''}"
+                          @click=${() => { this._rightTab = 'automations'; }}>Automations</button>
+                        <button class="right-tab ${this._rightTab === 'calibration' ? 'active' : ''}"
+                          @click=${() => { this._rightTab = 'calibration'; }}>Calibration</button>
+                      </div>
+                    ` : ''}
+                    ${this.isTank && this._rightTab === 'calibration'
+                      ? this._renderCalibrationSection()
+                      : html`
                     <!-- Simplified sensor automation: value above/below threshold → target → action -->
                     <div class="modal-section">
                       <div class="modal-section-header">
@@ -1228,14 +1499,7 @@ class VanCtlModalEdit extends LitElement {
                             </div>
                             <div class="auto-row-target">
                               <span class="auto-row-label-text">Target</span>
-                              <smartvanio-entity-picker
-                                .hass=${this.hass}
-                                .value=${row.target_entity_id}
-                                .domains=${["light", "switch", "fan", "scene", "cover", "lock"]}
-                                pinned-entity=${this.entityId}
-                                placeholder="Select target…"
-                                @smartvanio-change=${(e) => this._emit("smartvanio-update-edit-row", { id: i, field: "target_entity_id", value: e.detail.value })}
-                              ></smartvanio-entity-picker>
+                              ${this._renderTargets(row, i)}
                             </div>
                             <div class="auto-row-action">
                               <span class="auto-row-label-text">Action</span>
@@ -1260,6 +1524,7 @@ class VanCtlModalEdit extends LitElement {
                         `,
                       )}
                     </div>
+                    `}
                   ` : html`
                     <div class="modal-section">
                       <div class="modal-section-header">
@@ -1297,14 +1562,7 @@ class VanCtlModalEdit extends LitElement {
                             </div>
                             <div class="auto-row-target">
                               <span class="auto-row-label-text">Target</span>
-                              <smartvanio-entity-picker
-                                .hass=${this.hass}
-                                .value=${row.target_entity_id}
-                                .domains=${["light", "switch", "fan", "scene", "cover", "lock"]}
-                                pinned-entity=${this.entityId}
-                                placeholder="Select target…"
-                                @smartvanio-change=${(e) => this._emit("smartvanio-update-edit-row", { id: i, field: "target_entity_id", value: e.detail.value })}
-                              ></smartvanio-entity-picker>
+                              ${this._renderTargets(row, i)}
                             </div>
                             <div class="auto-row-action">
                               <span class="auto-row-label-text">Action</span>
@@ -1381,6 +1639,13 @@ class VanCtlModalEdit extends LitElement {
   }
 
   _actionsForEntity(entity_id) {
+    // May receive an array now that rows can hold multiple targets. Offer the
+    // actions common to every target so a chosen action is valid for all.
+    if (Array.isArray(entity_id)) {
+      const lists = entity_id.filter(Boolean).map((e) => this._actionsForEntity(e));
+      if (!lists.length) return [];
+      return lists.reduce((acc, l) => acc.filter((a) => l.includes(a)));
+    }
     const domain = entity_id?.split(".")?.[0];
     if (domain === "light")
       return ["toggle", "turn_on", "turn_off", "turn_on_for", "set_brightness"];
@@ -1532,12 +1797,142 @@ class VanCtlModalEdit extends LitElement {
           min-width: 0;
         }
 
+        .tgt-wrap { display: flex; flex-direction: column; gap: 6px; }
+        .tgt-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+        .tgt-chip {
+          display: inline-flex;
+          align-items: center;
+          gap: 3px;
+          padding: 2px 4px 2px 8px;
+          border-radius: 10px;
+          background: var(--secondary-background-color, #f5f5f5);
+          font-size: 12px;
+          max-width: 100%;
+        }
+        .tgt-chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .tgt-chip-x {
+          background: none; border: none; padding: 0 2px; cursor: pointer;
+          color: var(--secondary-text-color); display: inline-flex;
+        }
+        .tgt-chip-x:hover { color: var(--primary-text-color); }
+        .tgt-hint {
+          margin: 0; font-size: 11px; line-height: 1.35;
+          color: var(--secondary-text-color);
+        }
+        .res-appearance { display: flex; gap: 12px; align-items: flex-start; }
+        .res-color-field { display: flex; flex-direction: column; gap: 4px; flex: 0 0 84px; }
+        .res-icon-field  { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
+        .res-color {
+          width: 100%;
+          height: 38px;
+          padding: 2px;
+          border: 1px solid var(--divider-color, #ccc);
+          border-radius: 6px;
+          background: none;
+          cursor: pointer;
+        }
+
+        .cal-res-row { display: flex; gap: 10px; }
+        .cal-res-field { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+        .cal-res-field .cal-input { width: 100%; }
+
         .switch-mode-hint {
           margin: 8px 0 0;
           font-size: 12px;
           line-height: 1.4;
           color: var(--secondary-text-color);
         }
+      .onc-row {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      .grp-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+      .grp-row-edit {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        border: 1px solid transparent;
+        border-radius: var(--sv-radius-sm, 8px);
+        padding: 2px 4px;
+      }
+      .grp-row-edit.on {
+        border-color: var(--sv-border, #2a2a3a);
+        background: rgba(74, 158, 255, 0.08);
+      }
+      .grp-check, .grp-trash {
+        display: flex;
+        align-items: center;
+        background: none;
+        border: none;
+        padding: 5px;
+        cursor: pointer;
+        color: var(--sv-text-secondary, #9a9ab0);
+      }
+      .grp-row-edit.on .grp-check { color: var(--sv-accent, #4a9eff); }
+      .grp-trash:hover { color: var(--sv-red, #ff453a); }
+      .grp-name {
+        flex: 1;
+        min-width: 0;
+        padding: 7px 9px;
+        font: inherit;
+        font-size: 13px;
+        color: var(--sv-text-primary, #fff);
+        background: var(--sv-bg-base, #0b0b12);
+        border: 1px solid var(--sv-border, #2a2a3a);
+        border-radius: var(--sv-radius-sm, 8px);
+      }
+      .grp-name:focus-visible { outline: 2px solid var(--sv-accent, #4a9eff); outline-offset: 1px; }
+      .grp-new { display: flex; gap: 6px; align-items: center; }
+      .grp-add {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 7px 11px;
+        font: inherit;
+        font-size: 12px;
+        color: var(--sv-text-primary, #fff);
+        background: none;
+        border: 1px solid var(--sv-border, #2a2a3a);
+        border-radius: var(--sv-radius-sm, 8px);
+        cursor: pointer;
+        flex: none;
+      }
+      .grp-add[disabled] { opacity: 0.4; cursor: default; }
+      .onc-opt {
+        flex: 1 1 0;
+        min-width: 72px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 5px;
+        padding: 9px 6px;
+        border: 1px solid var(--sv-border, #2a2a3a);
+        border-radius: var(--sv-radius-sm, 8px);
+        background: none;
+        color: var(--sv-text-secondary, #9a9ab0);
+        font-size: 11px;
+        font-family: inherit;
+        cursor: pointer;
+      }
+      .onc-opt.active {
+        border-color: var(--sv-accent, #4a9eff);
+        color: var(--sv-text-primary, #fff);
+        background: rgba(74, 158, 255, 0.1);
+      }
+      .onc-swatch {
+        width: 22px;
+        height: 22px;
+        border-radius: 50%;
+        border: 1px solid rgba(255, 255, 255, 0.25);
+      }
+      .onc-icon { --mdc-icon-size: 20px; height: 22px; }
+      .cal-hint {
+        margin: 8px 0 0;
+        font-size: 11px;
+        line-height: 1.45;
+        color: var(--sv-text-disabled, #8a8a9a);
+      }
 
         .modal-col-right {
           display: flex;
